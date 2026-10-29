@@ -274,19 +274,32 @@ type proc struct {
 
 func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 	t.Helper()
+	return startProcCommand(t, nil, []string{loghubBinary, "--config", cfgPath}, env...)
+}
+
+// startProcCommand starts argv with the metrics flag appended and returns
+// the process handle. prefix is inserted before loghubBinary so a test can
+// run the binary under strace or another wrapper.
+func startProcCommand(t *testing.T, prefix []string, argv []string, env ...string) *proc {
+	t.Helper()
 	addr := freeAddr(t)
+	argv = append(append([]string(nil), argv...), "--metrics", addr)
+	argv = append(append([]string(nil), prefix...), argv...)
 	logPath := filepath.Join(t.TempDir(), "loghub.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log file: %v", err)
 	}
-	cmd := exec.Command(loghubBinary, "--config", cfgPath, "--metrics", addr)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	// Put the child in its own process group so a wrapper such as strace
+	// and the process it traces are signalled together.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		t.Fatalf("start loghub: %v", err)
+		t.Fatalf("start %v: %v", argv, err)
 	}
 	p := &proc{t: t, cmd: cmd, addr: addr, logPath: logPath, logFile: logFile, waitCh: make(chan error, 1)}
 	go func() { p.waitCh <- cmd.Wait() }()
@@ -294,7 +307,7 @@ func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 		if p.done {
 			return
 		}
-		_ = p.cmd.Process.Kill()
+		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
 		<-p.waitCh
 		p.logFile.Close()
 		p.done = true
@@ -304,7 +317,7 @@ func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 
 func (p *proc) signal(sig syscall.Signal) {
 	p.t.Helper()
-	if err := p.cmd.Process.Signal(sig); err != nil {
+	if err := syscall.Kill(-p.cmd.Process.Pid, sig); err != nil {
 		p.t.Fatalf("signal %v: %v", sig, err)
 	}
 }
@@ -345,7 +358,7 @@ func (p *proc) stop() {
 
 func (p *proc) kill() (int, string) {
 	p.t.Helper()
-	if err := p.cmd.Process.Kill(); err != nil {
+	if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil {
 		p.t.Fatalf("kill: %v", err)
 	}
 	return p.waitExit(10 * time.Second)
@@ -657,6 +670,12 @@ func (s *sink) setStatuses(statuses ...int) {
 func (s *sink) setStatusFunc(fn func() int) {
 	s.mu.Lock()
 	s.statusFn = fn
+	s.mu.Unlock()
+}
+
+func (s *sink) setDelay(d time.Duration) {
+	s.mu.Lock()
+	s.delay = d
 	s.mu.Unlock()
 }
 
