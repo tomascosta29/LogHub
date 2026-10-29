@@ -30,3 +30,19 @@ func unflock(f *os.File) error {
 }
 
 var errAlreadyLocked = syscall.EWOULDBLOCK
+
+// openNoFollow refuses a lock path that is a symlink.
+const openNoFollow = syscall.O_NOFOLLOW
+
+// lockDir takes an exclusive, non-blocking flock on a directory.
+func lockDir(dir string) (*os.File, error) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := flock(d, true); err != nil {
+		d.Close()
+		return nil, err
+	}
+	return d, nil
+}

@@ -2,6 +2,7 @@ package source
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -44,9 +45,15 @@ type FileSource struct {
 	fileID     string
 	reader     *bufio.Reader
 	lastOffset int64
-	batchSize  int
-	mu         sync.Mutex
+	// prefix holds the first bytes already read from the open file. If
+	// they change, the file was truncated and rewritten in place.
+	prefix    []byte
+	batchSize int
+	mu        sync.Mutex
 }
+
+// prefixLen is how much of the start of a file is kept to recognize it.
+const prefixLen = 256
 
 func NewFileSource(filePath, sourceName string, batchSize int) (*FileSource, error) {
 	if filePath == "" {
@@ -148,7 +155,7 @@ func (fs *FileSource) Collect(ctx context.Context, cursor string) ([]*core.LogEn
 			}
 			fs.closeFile()
 			fs.lastOffset = 0
-		case pathStat.Size() < fs.lastOffset:
+		case pathStat.Size() < fs.lastOffset, fs.rewritten():
 			fs.closeFile()
 			fs.lastOffset = 0
 		}
@@ -161,7 +168,44 @@ func (fs *FileSource) Collect(ctx context.Context, cursor string) ([]*core.LogEn
 	}
 
 	entries, err := fs.readLines(ctx, false)
+	fs.rememberPrefix()
 	return entries, fs.cursor(), err
+}
+
+// rewritten reports whether the open file was truncated and written again
+// since the last read, which a size check misses once the new content is
+// longer than the old offset. The offset always follows a newline, and the
+// file's first bytes were recorded as they were read; either changing
+// means the content at the offset is not what was read up to it.
+func (fs *FileSource) rewritten() bool {
+	if fs.lastOffset == 0 {
+		return false
+	}
+	var b [1]byte
+	if _, err := fs.file.ReadAt(b[:], fs.lastOffset-1); err != nil || b[0] != '\n' {
+		return true
+	}
+	if len(fs.prefix) == 0 {
+		return false
+	}
+	cur := make([]byte, len(fs.prefix))
+	if _, err := fs.file.ReadAt(cur, 0); err != nil {
+		return true
+	}
+	return !bytes.Equal(cur, fs.prefix)
+}
+
+// rememberPrefix records up to prefixLen bytes from the start of the open
+// file, limited to what has already been read.
+func (fs *FileSource) rememberPrefix() {
+	n := min(int64(prefixLen), fs.lastOffset)
+	if fs.file == nil || int64(len(fs.prefix)) >= n {
+		return
+	}
+	buf := make([]byte, n)
+	if _, err := fs.file.ReadAt(buf, 0); err == nil {
+		fs.prefix = buf
+	}
 }
 
 // open opens the file at the path and positions it at lastOffset. A
@@ -184,6 +228,10 @@ func (fs *FileSource) open() error {
 	}
 	fs.file = file
 	fs.fileID = id
+	fs.prefix = nil
+	if fs.rewritten() {
+		fs.lastOffset = 0
+	}
 	return fs.seek()
 }
 
@@ -206,6 +254,7 @@ func (fs *FileSource) closeFile() {
 	}
 	fs.file = nil
 	fs.reader = nil
+	fs.prefix = nil
 }
 
 func (fs *FileSource) cursor() string {

@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -771,5 +772,59 @@ func TestReadCommittedCallbackCanAppend(t *testing.T) {
 	}
 	if seen != 1 {
 		t.Errorf("ReadCommitted returned %d entries, want 1 (later appends are not part of the read)", seen)
+	}
+}
+
+func writeRaw(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOpenRejectsUnreadableCommittedRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "j.journal")
+	writeRaw(t, path, `{"id":1,"data":"YQ=="}`+"\n"+"not json\n"+`{"barrier":true}`+"\n")
+	if _, err := Open(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Open = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestOpenRejectsGarbageFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "j.journal")
+	writeRaw(t, path, "\x00\xffnot\n\x00\xffnot\n")
+	if _, err := Open(path); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("Open = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestOpenTrimsTornTailAndKeepsCommittedRecords(t *testing.T) {
+	for name, tail := range map[string]string{
+		"torn line":   `{"id":2,"da`,
+		"zero fill":   "\x00\x00\x00\x00\n\x00\x00",
+		"uncommitted": `{"id":2,"data":"Yg=="}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "j.journal")
+			writeRaw(t, path, `{"id":1,"data":"YQ=="}`+"\n"+`{"barrier":true}`+"\n"+tail)
+			j, err := Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			defer j.Close()
+			if _, err := j.AppendBarrier([]byte("c")); err != nil {
+				t.Fatalf("AppendBarrier: %v", err)
+			}
+			var got []string
+			if err := j.ReadCommitted(func(_ int64, data []byte) error {
+				got = append(got, string(data))
+				return nil
+			}); err != nil {
+				t.Fatalf("ReadCommitted: %v", err)
+			}
+			if strings.Join(got, ",") != "a,c" {
+				t.Fatalf("committed records = %v, want [a c]: the tail must be dropped, not merged or committed", got)
+			}
+		})
 	}
 }

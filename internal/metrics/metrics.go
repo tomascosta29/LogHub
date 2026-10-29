@@ -102,6 +102,14 @@ var (
 		[]string{"pipeline_id"},
 	)
 
+	CheckpointErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "loghub_checkpoint_errors_total",
+			Help: "Total number of checkpoint writes that failed. Delivered entries whose checkpoint failed are sent again after a restart.",
+		},
+		[]string{"pipeline_id"},
+	)
+
 	PipelineRunning = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "loghub_pipeline_running",
@@ -222,6 +230,7 @@ func Register() {
 		SendDuration,
 		Retries,
 		CheckpointsSaved,
+		CheckpointErrors,
 		PipelineRunning,
 		PipelineStatus,
 		PollInterval,

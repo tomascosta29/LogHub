@@ -330,6 +330,7 @@ func touchAllMetrics(t *testing.T, docs map[string]metricSpec) {
 		"loghub_batches_sent_total":            func() { metrics.BatchesSent.WithLabelValues("test").Add(0) },
 		"loghub_retries_total":                 func() { metrics.Retries.WithLabelValues("test", "http").Add(0) },
 		"loghub_checkpoints_saved_total":       func() { metrics.CheckpointsSaved.WithLabelValues("test").Add(0) },
+		"loghub_checkpoint_errors_total":       func() { metrics.CheckpointErrors.WithLabelValues("test").Add(0) },
 		"loghub_dlq_entries_total":             func() { metrics.DLQEntries.WithLabelValues("test").Add(0) },
 		"loghub_entries_dropped_total":         func() { metrics.EntriesDropped.WithLabelValues("test", "destination_rejected").Add(0) },
 		"loghub_circuit_breaker_tripped_total": func() { metrics.CircuitBreakerTrippedTotal.WithLabelValues("test", "http").Add(0) },

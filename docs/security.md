@@ -225,7 +225,7 @@ ORDER BY event_time ASC
 - [ ] Config examples use placeholder values only
 - [ ] Secret references use `${provider:name}` syntax
 - [ ] Production config loaded and validated
-- [ ] Checkpoint and DLQ directories on persistent storage with appropriate permissions
+- [ ] Checkpoint, disk buffer and DLQ directories on persistent storage, owned by the LogHub user. LogHub creates new state files `0600` and directories `0700`; files created by earlier releases keep their mode, so `chmod` them once
 
 ### Monitoring
 

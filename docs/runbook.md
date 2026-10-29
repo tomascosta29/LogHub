@@ -239,6 +239,16 @@ If a SQL source logs `checkpoint cursor "...": invalid cursor`, the pipeline sto
 
 To reset, stop LogHub and move `<checkpoint_dir>/<pipeline_id>.journal` aside. On the next start the source begins from the start of the table, or from `max_lookback` if set. To resume from a known point instead, set `max_lookback` for one start.
 
+### Corrupt State File
+
+If LogHub refuses to start with `journal is corrupt` or `holds the cursor of pipeline`, it names the file. The file was damaged or copied after it was written (see [reliability.md](reliability.md#state-file-integrity)); LogHub does not guess what it held. Keep a copy, then:
+
+- **Checkpoint (`<pipeline_id>.journal`)**: move it aside and reset the cursor as above. Expect duplicates for whatever is re-read.
+- **Disk buffer (`<pipeline_id>.buffer.journal`)**: move it aside. Its pending batches were never delivered; if the source still holds those records, they are read again from the checkpoint. Otherwise recover what you can from the copy.
+- **DLQ (`<pipeline_id>.dlq.journal`)**: move it aside. Records in it are lost unless recovered from the copy.
+
+A checkpoint is bound to its pipeline ID, so renaming a pipeline starts it without a cursor. Set `max_lookback` for the first start under the new name to avoid re-reading the whole source.
+
 ---
 
 ## Dead Letter Queue
@@ -427,10 +437,9 @@ kill -SIGTERM <pid>
 
 ### Checkpoint Safety on Rollback
 
-Rollback does not affect checkpoints. The cursor position is preserved in the checkpoint directory and is forward-only. After rollback:
-- The same cursor position is used
-- No data is lost or duplicated
-- In-flight batches at the time of shutdown are replayed (at-least-once semantics)
+Rolling back within a release line does not affect checkpoints: the same cursor position is used, and in-flight batches at shutdown are replayed (at-least-once).
+
+Rolling back across a release that changed a cursor format is different. The older binary cannot read the newer cursor: SQL sources report `unsupported version` (see [Invalid Checkpoint Cursor](#invalid-checkpoint-cursor)), and v1.1.0's file source cannot parse the `<offset>@<device>:<inode>` cursor written since. Before rolling back across such a release, stop LogHub and move each affected `<pipeline_id>.journal` aside, then set `max_lookback` (SQL) for the first start or accept a re-read of the file. The CHANGELOG lists cursor format changes under Migration Changes.
 
 ---
 

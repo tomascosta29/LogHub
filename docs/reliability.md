@@ -15,6 +15,21 @@ acknowledged prefix can advance a checkpoint. An older failed page blocks later
 delivery and new reads until it is delivered or durably dead-lettered. A read
 already in progress may finish and queue its page behind the failure.
 
+SQL cursors only move forward, by timestamp (and a tie-breaker for equal
+timestamps). A row committed with a timestamp older than the cursor (a
+long-running transaction, a backfill, or a writer whose clock is behind) is
+never read. Use a timestamp the database assigns at commit time, or keep
+writers' clocks in sync, where that matters.
+
+## File Source
+
+The `file` source follows one path. Its cursor is the byte offset just past the last complete line, plus the file's device and inode on Linux and macOS.
+
+- **Partial lines.** A final line without a newline is held back until the newline arrives.
+- **Rotation by rename.** When a new file appears at the path, the old file is read to its end first. A file that is rotated in and out between two polls is never opened, and its lines are lost. Rotation must be slower than `poll_interval`.
+- **Truncation (copytruncate).** The source starts again from the beginning when the file shrinks below the offset, or when the content before the offset has changed: the byte before it is no longer a newline, or the file's first bytes differ. Lines written between the last poll and the truncation are lost; that is inherent to copytruncate.
+- **Encoding.** Lines are treated as UTF-8. Invalid byte sequences are replaced with U+FFFD, because the JSON that destinations receive cannot carry them.
+
 ## Checkpoint Semantics
 
 Checkpoints are saved **only after** successful processing and delivery. `processBatch` in `pusher.go` handles each sub-batch in this sequence:
@@ -61,6 +76,15 @@ LogHub provides at-least-once delivery. After a crash or restart:
 - **Potential duplicate delivery**: Batches that were committed to the destination but not yet checkpointed may be replayed on restart.
 - The file checkpointer appends to each pipeline's journal and fsyncs a commit barrier. Operations on one pipeline serialize with each other; unrelated pipelines can write, recover or compact concurrently. Closing the checkpointer waits for active operations and rejects new operations after closure.
 - The read cursor is never persisted as an acknowledgement. On restart, saved disk-buffer pages drain first; collection then resumes from the acknowledged cursor.
+
+## State File Integrity
+
+Checkpoints, the disk buffer and the DLQ are journals: append-only files in which a commit marker, written with an fsync, closes each transaction.
+
+- **Crash leftovers.** After a crash a journal can end in a torn record or zero fill past its last commit. That tail was never committed; it is removed when the journal is opened.
+- **Corruption.** An unreadable record before the last commit means the file was damaged after it was written. LogHub refuses to start and names the file, rather than treating it as empty: that would restart a cursor from the beginning or discard a backlog. See the runbook's "Corrupt state file" section.
+- **Ownership.** A checkpoint records the pipeline it belongs to. A checkpoint copied from another pipeline, or kept across a rename, is refused.
+- **Access.** New state files are created `0600` and new state directories `0700`. A state path that is a symlink is refused. The checkpoint directory is locked as well as its `.lock` file, so deleting the lock file does not let a second instance in.
 
 ## MSSQL Duplicate Timestamp Handling
 

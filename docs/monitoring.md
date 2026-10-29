@@ -16,6 +16,7 @@ LogHub exposes metrics at the `/metrics` endpoint (default: `:9090`). The follow
 | `loghub_batches_sent_total` | `pipeline_id` | Total batches sent to destinations |
 | `loghub_retries_total` | `pipeline_id`, `destination_type` | Total retry attempts |
 | `loghub_checkpoints_saved_total` | `pipeline_id` | Total checkpoints saved |
+| `loghub_checkpoint_errors_total` | `pipeline_id` | Checkpoint writes that failed. Delivery continues and the pipeline goes `degraded`; until a checkpoint succeeds, a restart re-sends what was delivered since the last saved one |
 | `loghub_dlq_entries_total` | `pipeline_id` | Total entries written to dead letter queue |
 | `loghub_entries_dropped_total` | `pipeline_id`, `reason` | Entries rejected with no DLQ configured. `reason` is `processor_rejected` or `destination_rejected`. Older builds also emitted `no_disk_buffer` and `spill_failed`; pending delivery is now retained for ordered retry instead of dropped |
 | `loghub_circuit_breaker_tripped_total` | `pipeline_id`, `destination_type` | Number of times the per-destination circuit breaker tripped open (or re-opened from half-open) |
@@ -127,14 +128,12 @@ groups:
 
       - alert: LogHubCheckpointSaveFailures
         expr: |
-          rate(loghub_checkpoints_saved_total[5m]) == 0
-          and loghub_entries_sent_total > 0
-        for: 2m
+          increase(loghub_checkpoint_errors_total[5m]) > 0
         labels:
-          severity: warning
+          severity: critical
         annotations:
           summary: "LogHub pipeline {{ $labels.pipeline_id }} checkpoint failures"
-          description: "Pipeline {{ $labels.pipeline_id }} is sending entries but not saving checkpoints."
+          description: "Pipeline {{ $labels.pipeline_id }} failed to save checkpoints in the last 5 minutes. Delivery continues, but a restart will re-send everything since the last saved checkpoint. Check the checkpoint directory's disk space and permissions; /health shows the error."
 ```
 
 ### Collection Alerts
@@ -355,7 +354,7 @@ This section describes how alerts should fire under various failure conditions.
 | Malformed data causing processor errors | `LogHubDLQGrow` | `loghub_dlq_entries_total` increases |
 | Failed delivery retained on disk | `LogHubDiskBufferGrowth` | `loghub_disk_buffer_batches` > 0 |
 | Prolonged destination outage | `LogHubDiskBufferCritical`, `LogHubDLQCritical` | `loghub_disk_buffer_batches` > 1000, DLQ entries > 100/hour |
-| Checkpoint write fails (disk full/permissions) | `LogHubCheckpointSaveFailures` | `loghub_checkpoints_saved_total` stops increasing while sends continue |
+| Checkpoint write fails (disk full/permissions) | `LogHubCheckpointSaveFailures` | `loghub_checkpoint_errors_total` increases, `loghub_checkpoints_saved_total` stops; the pipeline is `degraded` with the error in `/health` |
 | Source returns no new data | `LogHubPipelineStaleCheckpoint` | No change in `loghub_entries_collected_total` and `loghub_checkpoints_saved_total` for 5m+ |
 
 ## Log Format Requirements
@@ -405,6 +404,8 @@ The `/health` endpoint returns:
 - `503 Service Unavailable` when the orchestrator is not running, any pipeline is in the `stalled` state, or (when `health_staleness_threshold` is set) a running or degraded pipeline has not collected or sent within that threshold.
 
 The JSON body reports `status` (`up`/`down`), `running`, `uptime`, an optional `reason` for a 503, and per-pipeline `ID`, `Status`, `StartedAt`, `LastCollect`, `LastSend`, `LastError`, and `ErrorMsg` fields. `ErrorMsg` is the latest error while the pipeline is `degraded` or `stalled`, and is cleared once it is back to `running`; `LastError` keeps the time. Until a pipeline's first successful read or send, stall and staleness are measured from `StartedAt`.
+
+A `degraded` pipeline still returns 200. Degraded covers errors a restart does not fix: a destination rejecting entries, a full checkpoint disk. Returning 503 for them would make a liveness probe restart LogHub in a loop. `/health` therefore answers "is LogHub alive and moving data?". Data loss and durability problems are alerted on from metrics: `LogHubEntriesDropped` (`loghub_entries_dropped_total`) and `LogHubCheckpointSaveFailures` (`loghub_checkpoint_errors_total`). For life-critical pipelines, page on both.
 
 This can be used for liveness/readiness probes in Kubernetes:
 

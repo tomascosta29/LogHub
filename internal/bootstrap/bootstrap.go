@@ -104,12 +104,17 @@ func (a *App) onSecretChange(changed []string) {
 	slog.Warn("Secret value changed; send SIGHUP or restart to apply it (or set global.reload_on_secret_change)", "secrets", changed)
 }
 
-// Run starts the orchestrator and blocks until shutdown.
+// Run starts the orchestrator and blocks until shutdown. It returns an
+// error when the shutdown itself reported one, so the process can exit
+// non-zero after a lossy stop.
 func (a *App) Run() error {
 	if err := a.Orchestrator.Start(); err != nil {
 		return fmt.Errorf("failed to start orchestrator: %w", err)
 	}
 	a.Orchestrator.Wait()
+	if err := a.Orchestrator.ShutdownErr(); err != nil {
+		return fmt.Errorf("shutdown: %w", err)
+	}
 	return nil
 }
 
@@ -438,15 +443,21 @@ func (a *App) buildReloadFunc(ctx context.Context) func() error {
 			slog.Info("Reload picked up changed secrets", "secrets", changed)
 		}
 
-		pipelines, err := a.buildPipelineList(ctx, cfg, a.Checkpointer, a.secretHolder, true)
-		if err != nil {
-			return fmt.Errorf("failed to rebuild pipelines: %w", err)
+		if err := ValidatePluginTypes(cfg); err != nil {
+			return fmt.Errorf("failed to reload config: %w", err)
 		}
 
-		if err := a.Orchestrator.ReplacePipelines(pipelines); err != nil {
+		build := func() ([]*pipeline.Pipeline, error) {
+			pipelines, err := a.buildPipelineList(ctx, cfg, a.Checkpointer, a.secretHolder, true)
+			if err != nil {
+				return nil, fmt.Errorf("failed to rebuild pipelines: %w", err)
+			}
+			return pipelines, nil
+		}
+		if err := a.Orchestrator.ReplacePipelinesWith(build); err != nil {
 			// The old pipelines are already stopped and closed, so they
 			// are rebuilt from the previous config.
-			slog.Error("New pipelines failed to start; restoring the previous configuration", "error", err)
+			slog.Error("New pipelines failed to build or start; restoring the previous configuration", "error", err)
 			previous, buildErr := a.buildPipelineList(ctx, a.Config, a.Checkpointer, a.secretHolder, false)
 			if buildErr != nil {
 				return errors.Join(fmt.Errorf("failed to replace pipelines: %w", err), fmt.Errorf("failed to restore previous pipelines: %w", buildErr))

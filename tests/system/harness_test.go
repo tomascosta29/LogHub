@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -274,19 +276,32 @@ type proc struct {
 
 func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 	t.Helper()
+	return startProcCommand(t, nil, []string{loghubBinary, "--config", cfgPath}, env...)
+}
+
+// startProcCommand starts argv with the metrics flag appended and returns
+// the process handle. prefix is inserted before loghubBinary so a test can
+// run the binary under strace or another wrapper.
+func startProcCommand(t *testing.T, prefix []string, argv []string, env ...string) *proc {
+	t.Helper()
 	addr := freeAddr(t)
+	argv = append(append([]string(nil), argv...), "--metrics", addr)
+	argv = append(append([]string(nil), prefix...), argv...)
 	logPath := filepath.Join(t.TempDir(), "loghub.log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("create log file: %v", err)
 	}
-	cmd := exec.Command(loghubBinary, "--config", cfgPath, "--metrics", addr)
+	cmd := exec.Command(argv[0], argv[1:]...)
+	// Put the child in its own process group so a wrapper such as strace
+	// and the process it traces are signalled together.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		t.Fatalf("start loghub: %v", err)
+		t.Fatalf("start %v: %v", argv, err)
 	}
 	p := &proc{t: t, cmd: cmd, addr: addr, logPath: logPath, logFile: logFile, waitCh: make(chan error, 1)}
 	go func() { p.waitCh <- cmd.Wait() }()
@@ -294,7 +309,7 @@ func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 		if p.done {
 			return
 		}
-		_ = p.cmd.Process.Kill()
+		_ = killProcess(p)
 		<-p.waitCh
 		p.logFile.Close()
 		p.done = true
@@ -304,7 +319,7 @@ func startProc(t *testing.T, cfgPath string, env ...string) *proc {
 
 func (p *proc) signal(sig syscall.Signal) {
 	p.t.Helper()
-	if err := p.cmd.Process.Signal(sig); err != nil {
+	if err := signalProcess(p, sig); err != nil {
 		p.t.Fatalf("signal %v: %v", sig, err)
 	}
 }
@@ -345,10 +360,32 @@ func (p *proc) stop() {
 
 func (p *proc) kill() (int, string) {
 	p.t.Helper()
-	if err := p.cmd.Process.Kill(); err != nil {
+	if err := killProcess(p); err != nil {
 		p.t.Fatalf("kill: %v", err)
 	}
 	return p.waitExit(10 * time.Second)
+}
+
+// exitedWithin reports whether the process exited within d, without
+// killing it. It is used by tests that accept either a clean refusal to
+// start or a running process.
+func (p *proc) exitedWithin(d time.Duration) (code int, exited bool, logs string) {
+	p.t.Helper()
+	select {
+	case err := <-p.waitCh:
+		p.done = true
+		p.logFile.Close()
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				code = -1
+			}
+		}
+		return code, true, p.log()
+	case <-time.After(d):
+		return 0, false, p.log()
+	}
 }
 
 func (p *proc) log() string {
@@ -393,6 +430,7 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 type healthPipeline struct {
 	ID          string    `json:"ID"`
 	Status      string    `json:"Status"`
+	StartedAt   time.Time `json:"StartedAt"`
 	LastCollect time.Time `json:"LastCollect"`
 	LastSend    time.Time `json:"LastSend"`
 	LastError   time.Time `json:"LastError"`
@@ -565,15 +603,17 @@ func waitForMetric(t *testing.T, addr, name string, labels map[string]string, ti
 // --- scripted HTTP sink ---
 
 type sink struct {
-	mu       sync.Mutex
-	statuses []int
-	delay    time.Duration
-	requests int
-	entries  int
-	accepted int
-	bodies   [][]byte
-	headers  []http.Header
-	methods  []string
+	mu             sync.Mutex
+	statuses       []int
+	statusFn       func() int
+	delay          time.Duration
+	requests       int
+	entries        int
+	accepted       int
+	bodies         [][]byte
+	acceptedBodies [][]byte
+	headers        []http.Header
+	methods        []string
 }
 
 func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
@@ -583,7 +623,9 @@ func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
 		status := http.StatusOK
-		if len(s.statuses) > 0 {
+		if s.statusFn != nil {
+			status = s.statusFn()
+		} else if len(s.statuses) > 0 {
 			idx := s.requests
 			if idx >= len(s.statuses) {
 				idx = len(s.statuses) - 1
@@ -596,6 +638,7 @@ func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
 		s.entries += len(entries)
 		if status < 400 {
 			s.accepted += len(entries)
+			s.acceptedBodies = append(s.acceptedBodies, body)
 		}
 		s.bodies = append(s.bodies, body)
 		s.headers = append(s.headers, r.Header.Clone())
@@ -622,6 +665,14 @@ func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
 func (s *sink) setStatuses(statuses ...int) {
 	s.mu.Lock()
 	s.statuses = statuses
+	s.mu.Unlock()
+}
+
+// setStatusFunc installs a per-request status chooser. It overrides the
+// fixed status script and lets a scenario vary the outcome of every call.
+func (s *sink) setStatusFunc(fn func() int) {
+	s.mu.Lock()
+	s.statusFn = fn
 	s.mu.Unlock()
 }
 
@@ -659,6 +710,62 @@ func (s *sink) lastMethod() string {
 		return ""
 	}
 	return s.methods[len(s.methods)-1]
+}
+
+// deliveredLogEntries decodes every request body as the array of LogEntry
+// objects the HTTP destination sends, in arrival order. Bodies that do not
+// decode are reported: silently skipping them would hide corruption.
+func (s *sink) deliveredLogEntries(t *testing.T) []core.LogEntry {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.bodies...)
+	s.mu.Unlock()
+	var out []core.LogEntry
+	for i, body := range bodies {
+		var entries []core.LogEntry
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("decode request body %d: %v", i, err)
+		}
+		out = append(out, entries...)
+	}
+	return out
+}
+
+// deliveredSentinelRecords decodes every request body as the flattened
+// Sentinel records a sentinel or local_jsonl format="sentinel" write
+// produces.
+// acceptedLogEntries decodes only the request bodies the server accepted.
+// Failed attempts are not deliveries and must not count in the oracle.
+func (s *sink) acceptedLogEntries(t *testing.T) []core.LogEntry {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.acceptedBodies...)
+	s.mu.Unlock()
+	var out []core.LogEntry
+	for i, body := range bodies {
+		var entries []core.LogEntry
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("decode accepted body %d: %v", i, err)
+		}
+		out = append(out, entries...)
+	}
+	return out
+}
+
+func (s *sink) deliveredSentinelRecords(t *testing.T) []map[string]string {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.bodies...)
+	s.mu.Unlock()
+	var out []map[string]string
+	for i, body := range bodies {
+		var records []map[string]string
+		if err := json.Unmarshal(body, &records); err != nil {
+			t.Fatalf("decode sentinel body %d: %v", i, err)
+		}
+		out = append(out, records...)
+	}
+	return out
 }
 
 // --- destination readers ---

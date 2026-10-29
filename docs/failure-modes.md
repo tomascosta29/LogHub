@@ -170,18 +170,18 @@ Without a DLQ configured at all, entries a processor or destination rejects indi
 
 **Expected Behavior** (`saveCheckpoint` in `internal/pipeline/pusher.go`):
 - `Checkpointer.Set()` returns an error.
-- The error is logged at error level.
+- The error is logged at error level and counted in `loghub_checkpoint_errors_total`, and the pipeline goes `degraded` with the error in `/health`.
 - The cursor **is** still advanced in memory, and the failed cursor is kept as pending; it is written again with the next checkpoint and at shutdown.
 - On the next poll, the source will use the in-memory cursor (not the failed checkpoint).
 
 **Data Loss or Duplication**: **Potential duplication**. If the process crashes after the cursor advances but before the checkpoint is durable, the same batch may be delivered twice on restart (the checkpoint still holds the old cursor).
 
 **Operator Action Required**:
-- Watch for "Failed to save checkpoint" log messages, or for `loghub_checkpoints_saved_total` no longer increasing while entries are sent.
+- Alert on `loghub_checkpoint_errors_total` (`LogHubCheckpointSaveFailures` in [monitoring.md](monitoring.md)).
 - If checkpoint failures are sustained, check disk health and checkpoint directory permissions.
 - After a crash, check for duplicate deliveries in Sentinel (use a unique identifier field to detect duplicates).
 
-**Checkpoint Implementation**: The file checkpointer writes atomically using `os.WriteFile` to a temp file followed by `os.Rename`, with sync before rename.
+**Checkpoint Implementation**: The file checkpointer appends the cursor to the pipeline's journal and fsyncs a commit marker. A failed commit is cut back off the file, so it cannot become durable later. See [State File Integrity](reliability.md#state-file-integrity).
 
 ---
 
@@ -305,7 +305,4 @@ The following failure scenarios have automated tests:
 - `TestDLQWrite` - DLQ write persistence
 - `TestPushRoutineFlushesPendingCheckpointOnShutdown` - Graceful shutdown checkpoint flush
 
-High-risk scenarios that may benefit from additional tests:
-- Checkpoint write failure followed by crash (potential duplication)
-- DLQ write failure on processor error (data loss scenario)
-- SIGTERM during in-flight delivery (graceful shutdown)
+The system tests in `tests/system` also kill LogHub at random points and at every write and fsync of the checkpoint, disk buffer and DLQ, inject fsync errors, corrupt state files, and check every scenario above against an end-to-end record count. Tests that inject faults with `strace` are skipped when it is not installed.

@@ -432,6 +432,14 @@ func (p *Pipeline) recordSend() {
 	p.evaluateStatus(now)
 }
 
+// recordCheckpointError counts a failed checkpoint write and marks the
+// pipeline degraded. Delivery continues, but until a checkpoint succeeds a
+// restart re-sends everything delivered since the last saved one.
+func (p *Pipeline) recordCheckpointError(err error) {
+	metrics.CheckpointErrors.WithLabelValues(p.ID).Inc()
+	p.recordError(fmt.Errorf("checkpoint not saved: %w", err))
+}
+
 // commitCursor checkpoints cursor and advances the in-memory cursor.
 func (p *Pipeline) commitCursor(cpState *checkpointState, cursor string) {
 	p.saveCheckpoint(cpState, cursor)
@@ -450,6 +458,7 @@ func (p *Pipeline) saveCheckpoint(cpState *checkpointState, cursor string) {
 	if shouldSave {
 		if err := p.Checkpointer.Set(p.ID, cursor); err != nil {
 			slog.Error("Failed to save checkpoint", "pipeline_id", p.ID, "error", err)
+			p.recordCheckpointError(err)
 		} else {
 			cpState.mu.Lock()
 			if cpState.pendingCursor == cursor {
@@ -471,6 +480,7 @@ func (p *Pipeline) flushCheckpoint(cpState *checkpointState) {
 	}
 	if err := p.Checkpointer.Set(p.ID, cursor); err != nil {
 		slog.Error("Failed to flush checkpoint", "pipeline_id", p.ID, "error", err)
+		p.recordCheckpointError(err)
 	} else {
 		cpState.mu.Lock()
 		if cpState.pendingCursor == cursor {

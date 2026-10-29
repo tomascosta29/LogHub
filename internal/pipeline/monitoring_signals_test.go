@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func collectErrors(id string) float64 {
 // A failed source read is counted in loghub_collect_errors_total, which
 // the LogHubCollectionErrors alert watches.
 func TestCollectErrorIsCounted(t *testing.T) {
-	const id = "collect-errors"
+	id := fmt.Sprintf("collect-errors-%d", time.Now().UnixNano())
 	src := &mockSource{err: errors.New("database unreachable")}
 	p := NewPipeline(id, src, nil, []DestinationInfo{makeDestInfo(&mockDestination{}, 0)}, &mockCheckpointer{}, &PipelineSettings{
 		BufferSize:   1,
@@ -79,5 +80,28 @@ func TestPerEntryRejectionDegradesPipeline(t *testing.T) {
 		if h.LastError.IsZero() || !strings.Contains(h.ErrorMsg, "rejected 1 of 3 entries") || !strings.Contains(h.ErrorMsg, "schema mismatch") {
 			t.Errorf("withDLQ=%v: LastError=%v ErrorMsg=%q, want the rejection recorded", withDLQ, h.LastError, h.ErrorMsg)
 		}
+	}
+}
+
+func TestFailedCheckpointDegradesPipelineAndIsCounted(t *testing.T) {
+	cp := &mockCheckpointer{setErr: errors.New("fsync: input/output error")}
+	p := NewPipeline("checkpoint-fails", &mockSource{}, nil, nil, cp, &PipelineSettings{
+		PollInterval:               time.Second,
+		StalledThresholdMultiplier: 5,
+	}, nil, nil)
+	p.SetStatus(PipelineStatusRunning)
+	p.mu.Lock()
+	p.health.StartedAt = time.Now()
+	p.mu.Unlock()
+	before := testutil.ToFloat64(metrics.CheckpointErrors.WithLabelValues("checkpoint-fails"))
+
+	p.commitCursor(&checkpointState{}, "cursor-1")
+
+	if got := testutil.ToFloat64(metrics.CheckpointErrors.WithLabelValues("checkpoint-fails")) - before; got != 1 {
+		t.Fatalf("checkpoint_errors_total increased by %v, want 1", got)
+	}
+	h := p.Health()
+	if p.Status() != PipelineStatusDegraded || !strings.Contains(h.ErrorMsg, "checkpoint not saved") {
+		t.Fatalf("status = %s, error = %q; want degraded with the checkpoint error", p.Status(), h.ErrorMsg)
 	}
 }

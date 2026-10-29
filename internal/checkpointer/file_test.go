@@ -313,8 +313,10 @@ func TestFileCheckpointerCompactsJournal(t *testing.T) {
 		}
 	}
 	lines := 0
-	if err := journal.ReadCommittedFile(filepath.Join(dir, "p.journal"), func(int64, []byte) error {
-		lines++
+	if err := journal.ReadCommittedFile(filepath.Join(dir, "p.journal"), func(_ int64, data []byte) error {
+		if !strings.HasPrefix(string(data), ownerPrefix) {
+			lines++
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("ReadCommittedFile: %v", err)
@@ -332,5 +334,36 @@ func TestFileCheckpointerCompactsJournal(t *testing.T) {
 	want := fmt.Sprintf("cursor-%d", compactEvery+4)
 	if got, err := reopened.Get("p"); err != nil || got != want {
 		t.Errorf("Get after compaction = %q, %v; want %q", got, err, want)
+	}
+}
+
+func TestCheckpointFromAnotherPipelineIsRejected(t *testing.T) {
+	dir := t.TempDir()
+	fc, err := NewFileCheckpointer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fc.Set("a", "cursor-a"); err != nil {
+		t.Fatal(err)
+	}
+	fc.Close()
+
+	data, err := os.ReadFile(filepath.Join(dir, "a.journal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.journal"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fc, err = NewFileCheckpointer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fc.Close()
+	if got, err := fc.Get("a"); err != nil || got != "cursor-a" {
+		t.Fatalf("Get(a) = %q, %v; want its own cursor", got, err)
+	}
+	if got, err := fc.Get("b"); err == nil {
+		t.Fatalf("Get(b) = %q from a's journal, want an error", got)
 	}
 }
