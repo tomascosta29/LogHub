@@ -341,10 +341,15 @@ func (g *oracleGenerator) verify(check oracleCheck) oracleResult {
 		res.InDLQ++
 	}
 
-	// Count each generated record across destinations and the DLQ.
+	// count records per destination and in the DLQ.
 	counts := make(map[string]int, len(genByID))
+	perDest := make(map[string]map[string]int, len(destSet))
 	for _, o := range check.Observed {
 		counts[o.ID]++
+		if perDest[o.Dest] == nil {
+			perDest[o.Dest] = make(map[string]int)
+		}
+		perDest[o.Dest][o.ID]++
 	}
 	for _, o := range check.DLQ {
 		counts[o.ID]++
@@ -364,19 +369,23 @@ func (g *oracleGenerator) verify(check oracleCheck) oracleResult {
 				check.Dropped-len(res.Missing)))
 		}
 	}
-	// Every generated record must be accounted for exactly once across the
-	// destination, DLQ and drop quota; unknown ids cannot be attributed.
-	extra := 0
-	for id, n := range counts {
+	for id := range counts {
 		if _, ok := genByID[id]; !ok {
 			res.Unknown = append(res.Unknown, id)
-			continue
 		}
-		if n > 1 {
+	}
+	// Duplicates are counted per destination: fan-out to several
+	// destinations is one copy each, not a duplicate.
+	extra := 0
+	for dest, ids := range perDest {
+		for id, n := range ids {
+			if n <= 1 {
+				continue
+			}
 			extra += n - 1
 			if !check.AllowDuplicates {
 				res.Duplicates += n - 1
-				res.Errors = append(res.Errors, fmt.Sprintf("duplicate delivery of id %s (%d copies) where duplicates are not allowed", id, n))
+				res.Errors = append(res.Errors, fmt.Sprintf("duplicate delivery of id %s to %s (%d copies) where duplicates are not allowed", id, dest, n))
 			}
 		}
 	}
@@ -393,6 +402,10 @@ func (g *oracleGenerator) verify(check oracleCheck) oracleResult {
 	// Every configured destination must have seen every record that was
 	// not dead-lettered for it or dropped. This catches a fan-out that
 	// silently skips a destination.
+	dlqIDs := make(map[string]bool, len(check.DLQ))
+	for _, o := range check.DLQ {
+		dlqIDs[o.ID] = true
+	}
 	for dest := range destSet {
 		seen := make(map[string]bool, len(arrivals[dest]))
 		for _, o := range arrivals[dest] {
@@ -400,7 +413,7 @@ func (g *oracleGenerator) verify(check oracleCheck) oracleResult {
 		}
 		var missing []string
 		for _, rec := range generated {
-			if !seen[rec.ID] && !inObserved(check.DLQ, dest, rec.ID) {
+			if !seen[rec.ID] && !dlqIDs[rec.ID] {
 				missing = append(missing, rec.ID)
 			}
 		}
