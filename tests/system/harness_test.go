@@ -661,6 +661,44 @@ func (s *sink) lastMethod() string {
 	return s.methods[len(s.methods)-1]
 }
 
+// deliveredLogEntries decodes every request body as the array of LogEntry
+// objects the HTTP destination sends, in arrival order. Bodies that do not
+// decode are reported: silently skipping them would hide corruption.
+func (s *sink) deliveredLogEntries(t *testing.T) []core.LogEntry {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.bodies...)
+	s.mu.Unlock()
+	var out []core.LogEntry
+	for i, body := range bodies {
+		var entries []core.LogEntry
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("decode request body %d: %v", i, err)
+		}
+		out = append(out, entries...)
+	}
+	return out
+}
+
+// deliveredSentinelRecords decodes every request body as the flattened
+// Sentinel records a sentinel or local_jsonl format="sentinel" write
+// produces.
+func (s *sink) deliveredSentinelRecords(t *testing.T) []map[string]string {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.bodies...)
+	s.mu.Unlock()
+	var out []map[string]string
+	for i, body := range bodies {
+		var records []map[string]string
+		if err := json.Unmarshal(body, &records); err != nil {
+			t.Fatalf("decode sentinel body %d: %v", i, err)
+		}
+		out = append(out, records...)
+	}
+	return out
+}
+
 // --- destination readers ---
 
 func readLogEntries(t *testing.T, path string) []core.LogEntry {
