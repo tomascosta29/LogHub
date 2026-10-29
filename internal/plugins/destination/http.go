@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,7 +82,7 @@ func NewHTTPWithHeaders(url string, timeout time.Duration, headers map[string]st
 	transport, release := acquireTransport(100)
 	return &HTTP{
 		url:              url,
-		client:           &http.Client{Timeout: timeout, Transport: transport},
+		client:           &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: noRedirects},
 		headers:          copiedHeaders,
 		releaseTransport: release,
 	}, nil
@@ -166,6 +168,14 @@ func (h *HTTP) Send(ctx context.Context, logs []*core.LogEntry) ([]core.EntrySta
 	return h.SendRaw(ctx, data, len(logs), nil)
 }
 
+// noRedirects stops the client from following redirects. For 301, 302
+// and 303, Go re-sends a POST as a GET without its body, so following
+// one would count a batch as delivered when it never was. The 3xx
+// response is returned to do and reported as a failed send instead.
+func noRedirects(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
+}
+
 func (h *HTTP) do(ctx context.Context, req *http.Request, n int) ([]core.EntryStatus, error) {
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -188,18 +198,61 @@ func (h *HTTP) do(ctx context.Context, req *http.Request, n int) ([]core.EntrySt
 		}
 	}
 
+	// Errors never include the response body: a destination can echo
+	// the request, tokens and log content included, and these errors are
+	// logged and stored in the DLQ.
+	detail := responseDetail(resp, body)
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return allSuccess(n), nil
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		return nil, fmt.Errorf("unexpected redirect %d; redirects are not followed, set url to the final address%s", resp.StatusCode, detail)
 	case resp.StatusCode == http.StatusBadRequest:
-		return allRejected(n, errors.Join(ErrBadRequest, fmt.Errorf("bad request: %s: %w", string(body), core.ErrPoisonPill))), nil
+		return allRejected(n, errors.Join(ErrBadRequest, fmt.Errorf("bad request%s: %w", detail, core.ErrPoisonPill))), nil
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		return nil, fmt.Errorf("authorization failed with status %d; check the destination's credentials and permissions%s", resp.StatusCode, detail)
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, fmt.Errorf("status 404; check the destination url%s", detail)
+	case resp.StatusCode == http.StatusRequestEntityTooLarge:
+		return nil, fmt.Errorf("status 413, request too large; lower runtime.send_batch_size%s", detail)
 	case resp.StatusCode == http.StatusTooManyRequests:
 		return nil, ErrRateLimited
 	case resp.StatusCode >= 500:
-		return nil, errors.Join(ErrServerError, fmt.Errorf("server error %d: %s", resp.StatusCode, string(body)))
+		return nil, errors.Join(ErrServerError, fmt.Errorf("server error %d%s", resp.StatusCode, detail))
 	default:
-		return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("unexpected status %d%s", resp.StatusCode, detail)
 	}
+}
+
+// diagnosticCode matches error codes and request IDs that are safe to put
+// in an error message: identifiers, not free text.
+var diagnosticCode = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,64}$`)
+
+// responseDetail returns the parts of a failed response that identify the
+// failure without repeating its content: the request ID header and, for
+// a JSON body of the form {"error": {"code": "..."}} as Azure Monitor
+// returns, the error code. Values that do not look like identifiers are
+// left out.
+func responseDetail(resp *http.Response, body []byte) string {
+	var parts []string
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &payload) == nil && diagnosticCode.MatchString(payload.Error.Code) {
+		parts = append(parts, "code "+payload.Error.Code)
+	}
+	for _, name := range []string{"X-Ms-Request-Id", "X-Request-Id"} {
+		if id := resp.Header.Get(name); diagnosticCode.MatchString(id) {
+			parts = append(parts, "request id "+id)
+			break
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 func allSuccess(n int) []core.EntryStatus {

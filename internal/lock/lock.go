@@ -40,8 +40,10 @@ func Acquire(path string) (*FileLock, error) {
 		return nil, fmt.Errorf("lock: failed to open %q: %w", path, err)
 	}
 	if err := flock(f, true); err != nil {
+		// Leave the file in place: it is the holder's lock. Removing it
+		// would let the next process lock a new file at the same path
+		// while the holder still runs.
 		f.Close()
-		os.Remove(path)
 		return nil, fmt.Errorf("lock: %q is held by another process: %w", path, err)
 	}
 	return &FileLock{path: path, f: f}, nil

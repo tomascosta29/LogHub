@@ -25,8 +25,9 @@ type JSONParseConfig struct {
 	// SourceField is the field to parse as JSON. If empty, uses Message.
 	SourceField string `json:"source_field"`
 
-	// TargetField is the field to merge parsed JSON into. If empty, merges into Fields directly.
-	// Use "fields" to merge into the top-level Fields map, or "message" to replace the message.
+	// TargetField selects where parsed JSON goes: "fields" (or empty)
+	// merges it into the top-level Fields map, and "message" also sets
+	// Message from the parsed "message" key. Other values are rejected.
 	TargetField string `json:"target_field"`
 
 	// KeepSource whether to keep the original source field after parsing.
@@ -42,6 +43,11 @@ type JSONParse struct {
 }
 
 func NewJSONParse(cfg JSONParseConfig) (*JSONParse, error) {
+	switch cfg.TargetField {
+	case "", "fields", "message":
+	default:
+		return nil, fmt.Errorf("json_parse: target_field must be \"fields\" or \"message\", got %q", cfg.TargetField)
+	}
 	if cfg.OnError == "" {
 		cfg.OnError = string(ErrorModeKeep)
 	}

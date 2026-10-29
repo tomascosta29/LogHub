@@ -32,6 +32,17 @@ var (
 		[]string{"pipeline_id", "destination_type"},
 	)
 
+	// CollectErrors counts failed source reads (Collect returning an
+	// error), such as a database or file that is unreachable. Reads
+	// cancelled because LogHub is stopping are not counted.
+	CollectErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "loghub_collect_errors_total",
+			Help: "Total number of failed source reads",
+		},
+		[]string{"pipeline_id", "source_name"},
+	)
+
 	BatchesCollected = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "loghub_batches_collected_total",
@@ -203,6 +214,7 @@ func Register() {
 		EntriesCollected,
 		EntriesSent,
 		EntriesFailed,
+		CollectErrors,
 		BatchesCollected,
 		BatchesSent,
 		BatchSize,

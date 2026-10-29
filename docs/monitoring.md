@@ -11,9 +11,10 @@ LogHub exposes metrics at the `/metrics` endpoint (default: `:9090`). The follow
 | `loghub_entries_collected_total` | `pipeline_id`, `source_name` | Total log entries collected from sources |
 | `loghub_entries_sent_total` | `pipeline_id`, `destination_type` | Total log entries sent to destinations |
 | `loghub_entries_failed_total` | `pipeline_id`, `destination_type` | Total log entries that failed to send |
+| `loghub_collect_errors_total` | `pipeline_id`, `source_name` | Failed source reads (the source returned an error, e.g. database or file unreachable). Reads cancelled by shutdown are not counted. Published at 0 when the pipeline is built |
 | `loghub_batches_collected_total` | `pipeline_id` | Total batches collected from sources |
 | `loghub_batches_sent_total` | `pipeline_id` | Total batches sent to destinations |
-| `loghub_retries_total` | `pipeline_id` | Total retry attempts |
+| `loghub_retries_total` | `pipeline_id`, `destination_type` | Total retry attempts |
 | `loghub_checkpoints_saved_total` | `pipeline_id` | Total checkpoints saved |
 | `loghub_dlq_entries_total` | `pipeline_id` | Total entries written to dead letter queue |
 | `loghub_entries_dropped_total` | `pipeline_id`, `reason` | Entries rejected with no DLQ configured. `reason` is `processor_rejected` or `destination_rejected`. Older builds also emitted `no_disk_buffer` and `spill_failed`; pending delivery is now retained for ordered retry instead of dropped |
@@ -140,13 +141,13 @@ groups:
 
 ```yaml
       - alert: LogHubCollectionErrors
-        expr: rate(loghub_entries_failed_total[5m]) > 0
+        expr: increase(loghub_collect_errors_total[5m]) > 0
         for: 2m
         labels:
           severity: warning
         annotations:
-          summary: "LogHub pipeline {{ $labels.pipeline_id }} collection errors"
-          description: "Pipeline {{ $labels.pipeline_id }} has collection errors for destination {{ $labels.destination_type }}."
+          summary: "LogHub pipeline {{ $labels.pipeline_id }} cannot read its source"
+          description: "Pipeline {{ $labels.pipeline_id }} failed to read source {{ $labels.source_name }} in the last 5 minutes. Check the source's availability and credentials; the pipeline's ErrorMsg in /health has the last error."
 ```
 
 ### Send and Retry Alerts
@@ -347,8 +348,9 @@ This section describes how alerts should fire under various failure conditions.
 | Failure Scenario | Expected Alert | Metric Behavior |
 |------------------|----------------|-----------------|
 | Pipeline crashes or is stopped | `LogHubPipelineNotRunning` | `loghub_pipeline_running` → 0 |
-| MSSQL source unavailable | `LogHubCollectionErrors` | `loghub_entries_failed_total` increases |
+| MSSQL source unavailable | `LogHubCollectionErrors` | `loghub_collect_errors_total` increases; the pipeline goes `degraded`, then `stalled` (`/health` 503) |
 | Sentinel/destination unavailable | `LogHubSendFailures`, `LogHubRetrySpike` | `loghub_entries_failed_total` increases, `loghub_retries_total` spikes |
+| Destination rejects individual entries (e.g. HTTP 400) | `LogHubDLQGrow` with a DLQ, `LogHubEntriesDropped` without one | `loghub_entries_failed_total` increases with no retries; the pipeline goes `degraded` with the rejection in `ErrorMsg` |
 | Destination returning 429/5xx | `LogHubRetrySpike`, `LogHubHighRetryRate` | `loghub_retries_total` >> `loghub_entries_sent_total` |
 | Malformed data causing processor errors | `LogHubDLQGrow` | `loghub_dlq_entries_total` increases |
 | Failed delivery retained on disk | `LogHubDiskBufferGrowth` | `loghub_disk_buffer_batches` > 0 |
@@ -399,8 +401,10 @@ slog.Error("HTTP request failed", "url", url, "body", fullBody)  // body may con
 ## Health Check Endpoint
 
 The `/health` endpoint returns:
-- `200 OK` if the orchestrator is running
-- `503 Service Unavailable` if all pipelines are stopped
+- `200 OK` when the orchestrator is running and no pipeline is stalled or stale.
+- `503 Service Unavailable` when the orchestrator is not running, any pipeline is in the `stalled` state, or (when `health_staleness_threshold` is set) a running or degraded pipeline has not collected or sent within that threshold.
+
+The JSON body reports `status` (`up`/`down`), `running`, `uptime`, an optional `reason` for a 503, and per-pipeline `ID`, `Status`, `StartedAt`, `LastCollect`, `LastSend`, `LastError`, and `ErrorMsg` fields. `ErrorMsg` is the latest error while the pipeline is `degraded` or `stalled`, and is cleared once it is back to `running`; `LastError` keeps the time. Until a pipeline's first successful read or send, stall and staleness are measured from `StartedAt`.
 
 This can be used for liveness/readiness probes in Kubernetes:
 

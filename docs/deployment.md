@@ -98,7 +98,7 @@ See [performance testing](performance.md) for local checks and measurements.
 | Memory | 512Mi | 1Gi+ |
 | CPU | 0.5 cores | 1-2 cores |
 
-Memory requirements scale with `buffer_size` and disk buffer usage. The default `buffer_size` is 100 batches in memory.
+Memory requirements scale with the source page size (`fetch_size` rows, default 100) and disk buffer usage: each pipeline holds at most two pages in memory, the one being delivered and one read ahead. `buffer_size` (default 100) is the capacity of the in-memory page queue, in pages; since the puller reads at most one page ahead, raising it does not raise memory use.
 
 ## Configuration Example
 

@@ -2,7 +2,10 @@ package destination
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -45,7 +48,14 @@ type DummyConfig struct {
 	Latency     string  `yaml:"latency"`
 }
 
+// errDummyDrop is the rejection the dummy destination reports for the
+// entries drop_rate selects.
+var errDummyDrop = errors.New("dummy: entry dropped by drop_rate")
+
 func NewDummy(cfg DummyConfig) (*Dummy, error) {
+	if cfg.DropRate < 0 || cfg.DropRate > 1 {
+		return nil, fmt.Errorf("dummy: drop_rate must be between 0 and 1, got %v", cfg.DropRate)
+	}
 	d := &Dummy{
 		dropRate:    cfg.DropRate,
 		logMessages: cfg.LogMessages,
@@ -65,12 +75,26 @@ func NewDummy(cfg DummyConfig) (*Dummy, error) {
 	return d, nil
 }
 
+// Send accepts every entry, after the configured latency, except a
+// drop_rate fraction of them, chosen at random, which it rejects with a
+// per-entry error as a destination rejecting bad records would.
 func (d *Dummy) Send(ctx context.Context, logs []*core.LogEntry) ([]core.EntryStatus, error) {
 	if d.latency > 0 {
-		time.Sleep(d.latency)
+		timer := time.NewTimer(d.latency)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		}
 	}
 
-	for _, entry := range logs {
+	statuses := allSuccess(len(logs))
+	for i, entry := range logs {
+		if d.dropRate > 0 && rand.Float64() < d.dropRate {
+			statuses[i].Error = errDummyDrop
+			continue
+		}
 		d.receivedCount.Add(1)
 		d.bytesReceived.Add(int64(len(entry.Message)))
 
@@ -82,7 +106,7 @@ func (d *Dummy) Send(ctx context.Context, logs []*core.LogEntry) ([]core.EntrySt
 		}
 	}
 
-	return allSuccess(len(logs)), nil
+	return statuses, nil
 }
 
 func (d *Dummy) Close() error {

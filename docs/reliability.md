@@ -4,10 +4,11 @@ LogHub provides at-least-once delivery semantics with cursor-based progress trac
 
 ## Cursor-Based Source Polling
 
-The puller owns a read cursor separate from the acknowledged cursor. With a
-buffered channel it may collect one page ahead of delivery: at most two source
-pages are being collected, queued, or delivered. A larger `buffer_size` does not
-increase this window; an unbuffered channel disables prefetch.
+The puller owns a read cursor separate from the acknowledged cursor. It may
+collect one page ahead of delivery: at most two source pages are being
+collected, queued, or delivered. `buffer_size`, the capacity of the in-memory
+page queue in pages, must be at least 1, and a larger value does not increase
+this window.
 
 The pusher processes pages and their sub-batches in order. Only that ordered
 acknowledged prefix can advance a checkpoint. An older failed page blocks later

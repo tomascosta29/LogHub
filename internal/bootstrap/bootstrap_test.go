@@ -3,8 +3,11 @@ package bootstrap
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -224,5 +227,190 @@ func TestSecretChangeTriggersReload(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProcessorBuildFailureFailsPipeline(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "loghub.yaml")
+	configContent := `
+global:
+  checkpoints_dir: "` + tmpDir + `/checkpoints"
+  metrics_enabled: false
+
+pipelines:
+  - id: "good"
+    source:
+      type: "file"
+      file:
+        path: "` + tmpDir + `/good.log"
+    destinations:
+      - type: "dummy"
+  - id: "bad-processor"
+    source:
+      type: "file"
+      file:
+        path: "` + tmpDir + `/bad.log"
+    processors:
+      - type: "does_not_exist"
+    destinations:
+      - type: "dummy"
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	app, err := NewApp(context.Background(), configPath)
+	if err != nil {
+		t.Fatalf("NewApp failed: %v", err)
+	}
+	defer app.Close()
+	healths := app.Orchestrator.PipelineHealths()
+	if len(healths) != 1 || healths[0].ID != "good" {
+		t.Fatalf("pipelines = %+v, want only \"good\"; a pipeline whose processor cannot be built must not run", healths)
+	}
+}
+
+func TestReloadWithAFailingPipelineKeepsCurrentPipelines(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "loghub.yaml")
+	pipelineYAML := func(id string, extra string) string {
+		return `
+  - id: "` + id + `"
+    source:
+      type: "file"
+      file:
+        path: "` + tmpDir + `/` + id + `.log"
+` + extra + `    destinations:
+      - type: "dummy"
+`
+	}
+	header := `
+global:
+  checkpoints_dir: "` + tmpDir + `/checkpoints"
+  metrics_enabled: false
+
+pipelines:`
+	if err := os.WriteFile(configPath, []byte(header+pipelineYAML("a", "")+pipelineYAML("b", "")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	app, err := NewApp(context.Background(), configPath)
+	if err != nil {
+		t.Fatalf("NewApp failed: %v", err)
+	}
+	defer app.Close()
+	if err := app.Orchestrator.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer app.Orchestrator.Shutdown()
+	before := app.Config
+
+	// "b" now has a processor that cannot be built. Replacing the running
+	// set with only "a" would silently stop "b".
+	broken := pipelineYAML("b", "    processors:\n      - type: \"does_not_exist\"\n")
+	if err := os.WriteFile(configPath, []byte(header+pipelineYAML("a", "")+broken), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.buildReloadFunc(context.Background())(); err == nil {
+		t.Fatal("reload succeeded although pipeline b cannot be built")
+	}
+	var ids []string
+	for _, h := range app.Orchestrator.PipelineHealths() {
+		ids = append(ids, h.ID)
+	}
+	if strings.Join(ids, ",") != "a,b" {
+		t.Fatalf("pipelines after failed reload = %v, want [a b] still running", ids)
+	}
+	if app.Config != before {
+		t.Fatal("app.Config was replaced by the config of a failed reload")
+	}
+}
+
+func TestHTTPDestinationSendsSourceName(t *testing.T) {
+	headers := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case headers <- r.Header.Get("X-LogSource"):
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "app.log"), []byte("hello\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(tmpDir, "loghub.yaml")
+	configContent := `
+global:
+  checkpoints_dir: "` + tmpDir + `/checkpoints"
+  metrics_enabled: false
+
+pipelines:
+  - id: "p"
+    runtime:
+      poll_interval: 10ms
+    source:
+      type: "file"
+      file:
+        path: "` + tmpDir + `/app.log"
+        name: "app-logs"
+    destinations:
+      - type: "http"
+        http:
+          url: "` + srv.URL + `"
+`
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	app, err := NewApp(context.Background(), configPath)
+	if err != nil {
+		t.Fatalf("NewApp failed: %v", err)
+	}
+	defer app.Close()
+	if err := app.Orchestrator.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer app.Orchestrator.Shutdown()
+
+	select {
+	case got := <-headers:
+		if got != "app-logs" {
+			t.Fatalf("X-LogSource = %q, want %q", got, "app-logs")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request reached the HTTP destination")
+	}
+}
+
+func TestValidatePluginTypes(t *testing.T) {
+	valid := &config.Config{Pipelines: []config.PipelineConfig{{
+		ID:           "p",
+		Source:       config.PluginConfig{Type: "file"},
+		Processors:   []config.PluginConfig{{Type: "filter"}},
+		Destinations: []config.PluginConfig{{Type: "dummy"}},
+	}}}
+	if err := ValidatePluginTypes(valid); err != nil {
+		t.Fatalf("ValidatePluginTypes rejected built-in types: %v", err)
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*config.PipelineConfig)
+	}{
+		{"source", func(pc *config.PipelineConfig) { pc.Source.Type = "syslog" }},
+		{"destination", func(pc *config.PipelineConfig) { pc.Destinations[0].Type = "dumy" }},
+		{"processor", func(pc *config.PipelineConfig) { pc.Processors[0].Type = "does_not_exist" }},
+	} {
+		pc := config.PipelineConfig{
+			ID:           "p",
+			Source:       config.PluginConfig{Type: "file"},
+			Processors:   []config.PluginConfig{{Type: "filter"}},
+			Destinations: []config.PluginConfig{{Type: "dummy"}},
+		}
+		tc.edit(&pc)
+		if err := ValidatePluginTypes(&config.Config{Pipelines: []config.PipelineConfig{pc}}); err == nil {
+			t.Errorf("unknown %s type accepted", tc.name)
+		}
 	}
 }

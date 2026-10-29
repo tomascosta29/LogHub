@@ -109,8 +109,10 @@ secrets:
   keyvault-prod:
     type: keyvault
     vault_url: "https://<keyvault-name>.vault.azure.net/"
-    tenant_id: "<tenant-id>"  # Optional: required for cross-tenant access
+    tenant_id: "<tenant-id>"  # Optional; see below
 ```
+
+Without `client_id`, LogHub authenticates with `DefaultAzureCredential`, and `tenant_id` sets the tenant it uses (for the environment, workload identity and developer credentials it tries). With `client_id`, LogHub uses that user-assigned managed identity, which always authenticates in its own tenant; `tenant_id` is then ignored, with a warning.
 
 ---
 

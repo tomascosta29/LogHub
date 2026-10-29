@@ -1422,3 +1422,63 @@ func TestSecretRefreshConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRejectsNonPositivePollAndShutdown(t *testing.T) {
+	tests := []struct{ name, global, runtime string }{
+		{"global poll_interval zero", `  poll_interval: "0"`, ""},
+		{"global shutdown_timeout negative", `  shutdown_timeout: "-1s"`, ""},
+		{"pipeline poll_interval zero", "", `    runtime:
+      poll_interval: "0"`},
+		{"pipeline poll_interval negative", "", `    runtime:
+      poll_interval: "-1s"`},
+		{"pipeline shutdown_timeout zero", "", `    runtime:
+      shutdown_timeout: "0s"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := `
+global:
+  checkpoints_dir: "./data"
+` + tt.global + `
+pipelines:
+  - id: "p"
+` + tt.runtime + `
+    source:
+      type: "file"
+      file:
+        path: "/var/log/test.log"
+    destinations:
+      - type: "dummy"
+`
+			_, err := loadConfigFromStringErr(t, content)
+			if err == nil || !strings.Contains(err.Error(), "must be positive") {
+				t.Fatalf("expected a must-be-positive error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnsafePipelineIDs(t *testing.T) {
+	for _, id := range []string{"../escape", "a/b", `a\b`, ".", "..", "a\nb"} {
+		cfg := &Config{Pipelines: []PipelineConfig{{
+			ID:           id,
+			Source:       PluginConfig{Type: "file"},
+			Destinations: []PluginConfig{{Type: "dummy"}},
+		}}}
+		cfg.Global.BufferSize = 1
+		if err := cfg.Validate(); err == nil {
+			t.Errorf("Validate accepted pipeline ID %q", id)
+		}
+	}
+	for _, id := range []string{"orders", "app.audit", "..hidden", "sql-01_eu"} {
+		cfg := &Config{Pipelines: []PipelineConfig{{
+			ID:           id,
+			Source:       PluginConfig{Type: "file"},
+			Destinations: []PluginConfig{{Type: "dummy"}},
+		}}}
+		cfg.Global.BufferSize = 1
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate rejected pipeline ID %q: %v", id, err)
+		}
+	}
+}

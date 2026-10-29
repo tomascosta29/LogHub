@@ -287,3 +287,14 @@ func TestTimestampInvalidDrop(t *testing.T) {
 		t.Fatalf("expected 0 results, got %d", len(result))
 	}
 }
+
+func TestJSONParseRejectsUnsupportedTargetField(t *testing.T) {
+	for _, target := range []string{"", "fields", "message"} {
+		if _, err := NewJSONParse(JSONParseConfig{TargetField: target}); err != nil {
+			t.Errorf("target_field %q rejected: %v", target, err)
+		}
+	}
+	if _, err := NewJSONParse(JSONParseConfig{TargetField: "payload"}); err == nil {
+		t.Error("target_field \"payload\" accepted; it would be silently ignored")
+	}
+}

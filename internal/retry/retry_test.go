@@ -311,3 +311,16 @@ func TestBreakerOpenDurationZeroDefaultsAreSafe(t *testing.T) {
 		t.Errorf("HalfOpenMaxCalls = %d, want 1", b.HalfOpenMaxCalls)
 	}
 }
+
+func TestRetrierZeroMaxRetriesStillCallsOnce(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		calls := 0
+		err := (&Retrier{MaxRetries: n, BaseBackoff: time.Millisecond}).Do(context.Background(), func() error {
+			calls++
+			return errors.New("fail")
+		})
+		if calls != 1 || err == nil {
+			t.Errorf("MaxRetries %d: calls = %d, err = %v; want one call and its error", n, calls, err)
+		}
+	}
+}

@@ -63,11 +63,15 @@ func NewKeyVaultProvider(ctx context.Context, cfg ProviderConfig) (*KeyVaultProv
 	var err error
 
 	if cfg.ClientID != "" {
+		if cfg.TenantID != "" {
+			// A managed identity always gets tokens from its own tenant.
+			slog.Warn("Key Vault provider: tenant_id is ignored when client_id selects a managed identity", "vault_url", cfg.VaultURL)
+		}
 		cred, err = azidentity.NewManagedIdentityCredential(&azidentity.ManagedIdentityCredentialOptions{
 			ID: azidentity.ClientID(cfg.ClientID),
 		})
 	} else {
-		cred, err = azidentity.NewDefaultAzureCredential(nil)
+		cred, err = azidentity.NewDefaultAzureCredential(defaultCredentialOptions(cfg))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create credential: %w", err)
@@ -79,6 +83,16 @@ func NewKeyVaultProvider(ctx context.Context, cfg ProviderConfig) (*KeyVaultProv
 	}
 
 	return &KeyVaultProvider{client: client}, nil
+}
+
+// defaultCredentialOptions applies tenant_id to DefaultAzureCredential: it
+// selects the tenant for the environment, workload identity and developer
+// credentials in its chain.
+func defaultCredentialOptions(cfg ProviderConfig) *azidentity.DefaultAzureCredentialOptions {
+	if cfg.TenantID == "" {
+		return nil
+	}
+	return &azidentity.DefaultAzureCredentialOptions{TenantID: cfg.TenantID}
 }
 
 func (p *KeyVaultProvider) GetSecret(ctx context.Context, name string) (string, error) {

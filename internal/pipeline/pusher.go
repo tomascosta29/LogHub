@@ -340,6 +340,10 @@ func (p *Pipeline) handleEntryStatuses(r destResult, entries []*core.LogEntry) b
 		return true
 	}
 	metrics.EntriesFailed.WithLabelValues(p.ID, destType).Add(float64(len(rejected)))
+	// Rejected entries are a pipeline error even when the rest of the
+	// batch was accepted: they mark the pipeline degraded and set
+	// LastError, like a batch-level failure.
+	p.recordError(fmt.Errorf("destination %s rejected %d of %d entries: %w", r.dest.key, len(rejected), len(entries), firstErr))
 	if err := p.deadLetter(rejected, r.dest.key, "destination rejected entry: "+firstErr.Error(), dropDestinationRejected); err != nil {
 		slog.Error("Failed to write rejected entries to DLQ, will retry the sub-batch", "pipeline_id", p.ID, "destination", r.dest.key, "error", err)
 		return false
@@ -487,34 +491,41 @@ func splitBatch(batch Batch, sendBatchSize int) []Batch {
 		return []Batch{batch}
 	}
 
-	subBatches := make([]Batch, 0, (len(batch.Entries)+sendBatchSize-1)/sendBatchSize)
-	for start := 0; start < len(batch.Entries); start += sendBatchSize {
+	n := len(batch.Entries)
+	subBatches := make([]Batch, 0, (n+sendBatchSize-1)/sendBatchSize)
+	for start := 0; start < n; {
 		end := start + sendBatchSize
-		if end > len(batch.Entries) {
-			end = len(batch.Entries)
+		if end > n {
+			end = n
+		}
+		// Sources resume after the committed cursor, so a sub-batch must
+		// end at an entry that has one: a later entry's cursor would skip
+		// the entries in between on restart. Shorten the sub-batch to its
+		// last entry with a cursor, or, if it has none, extend it to the
+		// next one (or to the end of the batch).
+		if end < n && cursorAt(batch, end-1) == "" {
+			cut := end - 1
+			for cut > start && cursorAt(batch, cut-1) == "" {
+				cut--
+			}
+			if cut > start {
+				end = cut
+			} else {
+				for end < n && cursorAt(batch, end-1) == "" {
+					end++
+				}
+			}
+		}
+		nextCursor := cursorAt(batch, end-1)
+		if nextCursor == "" && end == n {
+			nextCursor = batch.NextCursor
+		}
+		if nextCursor == "" {
+			slog.Warn("splitBatch: cannot determine NextCursor for sub-batch; data loss risk on restart", "sub_batch_start", start, "sub_batch_end", end)
 		}
 		var entryCursors []string
 		if len(batch.EntryCursors) >= end {
 			entryCursors = batch.EntryCursors[start:end]
-		}
-		// Choose a NextCursor for this sub-batch. The cursor must be unique
-		// per sub-batch; otherwise the cursor advance would skip work or
-		// duplicate it. Try in order:
-		//   1. The cursor of the last entry in this sub-batch.
-		//   2. The cursor of the first entry of the next sub-batch (which
-		//      is the entry immediately after this sub-batch).
-		//   3. The batch's overall NextCursor (used for the last sub-batch
-		//      and as a final fallback for any sub-batch).
-		//   4. Empty + warning: a data quality issue at the source.
-		nextCursor := cursorAt(batch, end-1)
-		if nextCursor == "" && end < len(batch.Entries) {
-			nextCursor = cursorAt(batch, end)
-		}
-		if nextCursor == "" {
-			nextCursor = batch.NextCursor
-		}
-		if nextCursor == "" {
-			slog.Warn("splitBatch: cannot determine NextCursor for sub-batch; data loss risk on restart", "sub_batch_start", start, "sub_batch_end", end, "pipeline_id_implicit", true)
 		}
 		subBatches = append(subBatches, Batch{
 			Entries:      batch.Entries[start:end],
@@ -522,6 +533,7 @@ func splitBatch(batch Batch, sendBatchSize int) []Batch {
 			NextCursor:   nextCursor,
 			Destinations: batch.Destinations,
 		})
+		start = end
 	}
 	return subBatches
 }

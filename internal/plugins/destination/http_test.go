@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -243,5 +245,60 @@ func TestHTTPEmptyHeaderName(t *testing.T) {
 	_, err := NewHTTPWithHeaders("http://localhost", 5*time.Second, headers)
 	if err == nil {
 		t.Error("Expected error for empty header name")
+	}
+}
+
+func TestHTTPDoesNotFollowRedirects(t *testing.T) {
+	var gets atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/moved" {
+			http.Redirect(w, r, "/ok", http.StatusFound)
+			return
+		}
+		gets.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h, err := NewHTTP(srv.URL+"/moved", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if _, err := h.Send(context.Background(), []*core.LogEntry{{Message: "m"}}); err == nil {
+		t.Fatal("Send through a redirect succeeded; the POST body would have been dropped")
+	}
+	if gets.Load() != 0 {
+		t.Fatalf("redirect target was requested %d times, want 0", gets.Load())
+	}
+}
+
+func TestHTTPErrorsOmitResponseBody(t *testing.T) {
+	const secret = "SECRET-TOKEN-123"
+	for _, status := range []int{400, 401, 403, 404, 413, 500, 418} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Ms-Request-Id", "req-42")
+			w.WriteHeader(status)
+			w.Write([]byte(`{"error":{"code":"InvalidStream","message":"echo ` + secret + `"}}`))
+		}))
+		h, err := NewHTTP(srv.URL, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		statuses, err := h.Send(context.Background(), []*core.LogEntry{{Message: "m"}})
+		if err == nil && len(statuses) == 1 {
+			err = statuses[0].Error
+		}
+		h.Close()
+		srv.Close()
+		if err == nil {
+			t.Fatalf("status %d: no error", status)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("status %d: error contains the response body: %v", status, err)
+		}
+		if !strings.Contains(err.Error(), "code InvalidStream") || !strings.Contains(err.Error(), "request id req-42") {
+			t.Errorf("status %d: error %q lacks the error code and request id", status, err)
+		}
 	}
 }

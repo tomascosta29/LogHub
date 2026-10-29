@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"gopkg.in/yaml.v3"
 )
@@ -21,10 +22,11 @@ type GlobalConfig struct {
 	// HTTPMaxIdleConnsPerHost bounds each shared HTTP destination idle pool.
 	// Zero selects the default of 100.
 	HTTPMaxIdleConnsPerHost int `yaml:"http_max_idle_conns_per_host"`
-	// DataDir is the root for per-pipeline on-disk state
-	// (checkpoints, disk buffer, DLQ). When set, per-pipeline dirs
-	// default to <DataDir>/<subsystem>/<pipelineID>. When empty,
-	// each subsystem must specify its own dir explicitly.
+	// DataDir is the root for the per-pipeline disk buffer and DLQ. When
+	// set, their dirs default to <DataDir>/{disk-buffer,dlq}/<pipelineID>;
+	// when empty, each must specify its own dir. Checkpoints are not
+	// under DataDir: they use CheckpointsDir, which defaults to
+	// ./data/checkpoints.
 	DataDir            string `yaml:"data_dir"`
 	CheckpointsDir     string `yaml:"checkpoints_dir"`
 	LogLevel           string `yaml:"log_level"`
@@ -622,6 +624,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate pipeline ID: %s", p.ID)
 		}
 		seen[p.ID] = true
+		if err := validatePipelineID(p.ID); err != nil {
+			return err
+		}
 		if err := p.validate(); err != nil {
 			return err
 		}
@@ -652,7 +657,29 @@ func (g *GlobalConfig) validateLimits() error {
 	return nil
 }
 
+// validatePipelineID rejects IDs that are unsafe as a file name. The ID
+// names the pipeline's checkpoint journal, disk buffer and DLQ files, so a
+// path separator or a "." / ".." ID would place them outside their
+// directory.
+func validatePipelineID(id string) error {
+	if id == "." || id == ".." {
+		return fmt.Errorf("pipeline ID %q is not allowed", id)
+	}
+	for _, r := range id {
+		if r == '/' || r == '\\' || unicode.IsControl(r) {
+			return fmt.Errorf("pipeline ID %q must not contain path separators or control characters", id)
+		}
+	}
+	return nil
+}
+
 func (g *GlobalConfig) validateDurations() error {
+	if err := validatePositiveDurations("global.", []namedValue{
+		{"poll_interval", g.PollInterval},
+		{"shutdown_timeout", g.ShutdownTimeout},
+	}); err != nil {
+		return err
+	}
 	return validateDurations("global.", []namedValue{
 		{"poll_interval", g.PollInterval},
 		{"shutdown_timeout", g.ShutdownTimeout},
@@ -707,6 +734,12 @@ func (p *PipelineConfig) validate() error {
 	}); err != nil {
 		return err
 	}
+	if err := validatePositiveDurations(fmt.Sprintf("pipeline %s.", p.ID), []namedValue{
+		{"runtime.poll_interval", p.Runtime.PollInterval},
+		{"runtime.shutdown_timeout", p.Runtime.ShutdownTimeout},
+	}); err != nil {
+		return err
+	}
 
 	if p.Runtime.BufferSize < 0 {
 		return fmt.Errorf("pipeline %s: runtime.buffer_size cannot be negative, got %d", p.ID, p.Runtime.BufferSize)
@@ -731,6 +764,19 @@ func validateDurations(prefix string, fields []namedValue) error {
 		}
 		if _, err := time.ParseDuration(f.val); err != nil {
 			return fmt.Errorf("invalid duration %s%s=%q: %w", prefix, f.name, f.val, err)
+		}
+	}
+	return nil
+}
+
+// validatePositiveDurations checks that every non-empty value that parses
+// as a duration is greater than zero. A zero or negative poll interval
+// would panic the pipeline's ticker. Parse errors are left to
+// validateDurations.
+func validatePositiveDurations(prefix string, fields []namedValue) error {
+	for _, f := range fields {
+		if d, err := time.ParseDuration(f.val); err == nil && d <= 0 {
+			return fmt.Errorf("%s%s must be positive, got %q", prefix, f.name, f.val)
 		}
 	}
 	return nil

@@ -31,6 +31,12 @@ func IsBuiltIn(name string) bool {
 	return plugins.IsBuiltIn(name)
 }
 
+// IsRegistered reports whether a factory is registered for the processor type.
+func IsRegistered(name string) bool {
+	_, ok := plugins.Lookup(name)
+	return ok
+}
+
 // Create instantiates a processor by type name.
 func Create(name string, props map[string]interface{}) (core.Processor, error) {
 	fn, ok := plugins.Lookup(name)

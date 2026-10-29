@@ -103,9 +103,11 @@ LogHub provides **at-least-once delivery** semantics. With cursor-based progress
 - `ErrBadRequest` and a `PoisonPill` error are returned.
 - `sendToDestination` sees the `ErrPoisonPill` and stops retrying immediately (`retry.ErrFatal`); the rejection does not count against the circuit breaker.
 - The batch is written to DLQ (if configured) for that destination only (for example `"sentinel#0"`), with an error containing `"bad request"`. Other destinations in the pipeline are not affected.
-- Once the DLQ write succeeds the cursor advances. Without a DLQ the batch is kept in the disk buffer and retried, and the cursor is not advanced.
+- Once the DLQ write succeeds the cursor advances. If the DLQ write fails, the batch is kept and retried, and the cursor is not advanced.
+- Without a DLQ, the rejected entries are dropped: the cursor advances, the drop is logged, and it is counted in `loghub_entries_dropped_total{reason="destination_rejected"}`. A rejected batch is not retried, because the destination would reject it again and block the pipeline.
+- Either way the pipeline is marked `degraded`, with the rejection in `/health`.
 
-**Data Loss or Duplication**: No data loss (preserved in DLQ). No duplication.
+**Data Loss or Duplication**: No data loss with a DLQ (preserved in DLQ). Without a DLQ, the rejected entries are lost. No duplication.
 
 **Operator Action Required**: Inspect the DLQ file to identify the malformed batch. Check the DCR stream definition and ensure source columns match. Fix the data transformation or DCR schema. Replay DLQ entries after fixing.
 
@@ -277,10 +279,10 @@ Batches in a v0.1.0 `<pipeline_id>.buffer` or `<pipeline_id>.buffer.drain` file 
 | MI token acquisition fails | No | Risk | Check identity permissions |
 | Sentinel 429 | No | No | Check rate limits |
 | Sentinel 5xx | No | No | Check Azure status |
-| Sentinel 400 (schema) | No | No | Fix DCR schema, replay DLQ |
+| Sentinel 400 (schema) | No with a DLQ; **Yes** without | No | Fix DCR schema, replay DLQ |
 | Disk buffer full | No | No | Increase size, investigate backpressure |
 | DLQ write fails (dest error) | No | No | Check DLQ disk space |
-| DLQ write fails (proc error) | **Yes** | No | Check DLQ disk space |
+| DLQ write fails (proc error) | No | No | Check DLQ disk space |
 | Checkpoint write fails | No | **Risk** | Check checkpoint disk |
 | Crash after delivery | No | **Risk** | Deduplicate in Sentinel |
 | SIGTERM during delivery | No | No | None (graceful) |

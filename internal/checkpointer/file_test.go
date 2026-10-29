@@ -191,7 +191,10 @@ func TestFileCheckpointerMigratesLegacyCursor(t *testing.T) {
 		t.Errorf("after migration, got %q, want %q", got, "legacy-cursor-value")
 	}
 	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Errorf("legacy file should be removed after migration, stat err: %v", err)
+		t.Errorf("legacy file should be renamed after migration, stat err: %v", err)
+	}
+	if _, err := os.Stat(legacy + ".migrated"); err != nil {
+		t.Errorf("legacy file should be kept as %s.migrated: %v", legacy, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "pipeline1.journal")); err != nil {
 		t.Errorf("journal should exist after migration: %v", err)

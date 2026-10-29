@@ -1,4 +1,4 @@
-.PHONY: build build-static test race fmt-check vet vulncheck
+.PHONY: build build-static test race fmt-check vet vulncheck test-monitoring test-contract test-system
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -12,6 +12,18 @@ build-static:
 
 test:
 	go test ./...
+
+# Monitoring contract and black-box endpoint/status scenarios.
+test-monitoring:
+	go test ./tests/monitoring -count=1 -v
+
+# Plugin schema/factory contract.
+test-contract:
+	go test ./tests/contract -count=1 -v
+
+# Real-binary system scenarios (SQLite, local_jsonl, HTTP, reload, CLI).
+test-system:
+	go test ./tests/contract ./tests/system -count=1 -v
 
 race:
 	go test -race ./...

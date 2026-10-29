@@ -289,3 +289,73 @@ func TestRequestReloadRunsReloadFunc(t *testing.T) {
 		t.Fatal("RequestReload did not run the reload function")
 	}
 }
+
+type failingGetCheckpointer struct{ mockCheckpointer }
+
+func (m *failingGetCheckpointer) Get(pipelineID string) (string, error) {
+	return "", errors.New("checkpoint unreadable")
+}
+
+func TestReplacePipelinesStartFailureCleansUp(t *testing.T) {
+	o := NewOrchestrator()
+	settings := pipeline.DefaultSettings()
+	oldSrc := &mockSource{}
+	o.AddPipeline(pipeline.NewPipeline("old", oldSrc, nil, []pipeline.DestinationInfo{{Destination: &mockDestination{}}}, &mockCheckpointer{}, settings, nil, nil))
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer o.Shutdown()
+
+	goodSrc, badSrc, laterSrc := &mockSource{}, &mockSource{}, &mockSource{}
+	good := pipeline.NewPipeline("good", goodSrc, nil, []pipeline.DestinationInfo{{Destination: &mockDestination{}}}, &mockCheckpointer{}, settings, nil, nil)
+	bad := pipeline.NewPipeline("bad", badSrc, nil, []pipeline.DestinationInfo{{Destination: &mockDestination{}}}, &failingGetCheckpointer{}, settings, nil, nil)
+	later := pipeline.NewPipeline("later", laterSrc, nil, []pipeline.DestinationInfo{{Destination: &mockDestination{}}}, &mockCheckpointer{}, settings, nil, nil)
+
+	err := o.ReplacePipelines([]*pipeline.Pipeline{good, bad, later})
+	if err == nil || !strings.Contains(err.Error(), "bad") {
+		t.Fatalf("ReplacePipelines error = %v, want the failing pipeline named", err)
+	}
+	if !oldSrc.closed.Load() {
+		t.Error("old pipeline was not stopped")
+	}
+	if !goodSrc.closed.Load() || !badSrc.closed.Load() || !laterSrc.closed.Load() {
+		t.Errorf("new pipelines left open: good=%v bad=%v later=%v", goodSrc.closed.Load(), badSrc.closed.Load(), laterSrc.closed.Load())
+	}
+	if n := len(o.PipelineHealths()); n != 0 {
+		t.Errorf("orchestrator reports %d pipelines after a failed replace, want 0", n)
+	}
+}
+
+// TestPipelineHealthsDuringReplace runs under -race: /health reads the
+// pipeline list while a reload replaces it.
+func TestPipelineHealthsDuringReplace(t *testing.T) {
+	o := NewOrchestrator()
+	settings := pipeline.DefaultSettings()
+	newPipeline := func(id string) *pipeline.Pipeline {
+		return pipeline.NewPipeline(id, &mockSource{}, nil, []pipeline.DestinationInfo{{Destination: &mockDestination{}}}, &mockCheckpointer{}, settings, nil, nil)
+	}
+	o.AddPipeline(newPipeline("p"))
+	if err := o.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer o.Shutdown()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 5; i++ {
+			if err := o.ReplacePipelines([]*pipeline.Pipeline{newPipeline("p")}); err != nil {
+				t.Errorf("ReplacePipelines: %v", err)
+				return
+			}
+		}
+	}()
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			o.PipelineHealths()
+		}
+	}
+}

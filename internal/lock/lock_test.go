@@ -49,6 +49,31 @@ func TestAcquireFailsWhenHeldByOtherProcess(t *testing.T) {
 	}
 }
 
+func TestFailedAcquireKeepsHoldersLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("flock is not supported on Windows in this implementation; production target is Linux")
+	}
+	path := filepath.Join(t.TempDir(), "test.lock")
+
+	first, err := Acquire(path)
+	if err != nil {
+		t.Fatalf("first Acquire: %v", err)
+	}
+	defer first.Release()
+
+	// A failed attempt must not remove the holder's lock file, or a
+	// third attempt would lock a new file at the same path.
+	for i := 2; i <= 3; i++ {
+		if l, err := Acquire(path); err == nil {
+			l.Release()
+			t.Fatalf("Acquire #%d succeeded while the first lock is held", i)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("lock file after failed Acquire #%d: %v", i, err)
+		}
+	}
+}
+
 func TestReleaseAllowsReacquire(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("flock is not supported on Windows in this implementation; production target is Linux")

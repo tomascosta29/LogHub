@@ -3,7 +3,12 @@ package source
 import (
 	"context"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
+
+	"loghub/internal/core"
 )
 
 func TestFileSourceCollect(t *testing.T) {
@@ -289,36 +294,229 @@ func TestFileSourceTruncationResetsAndReopens(t *testing.T) {
 	}
 }
 
-func TestFileSourceNoDataLossOnPartialRead(t *testing.T) {
-	// Regression test: a partial-line read (no trailing newline)
-	// at EOF must still be returned to the caller. The next Collect
-	// must NOT advance the cursor past the partial line and lose it.
-	tmpfile, err := os.CreateTemp("", "test-source-partial-*.log")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
+func TestFileSourceHoldsPartialLastLine(t *testing.T) {
+	// A last line without a newline is still being written. It must not
+	// be emitted (and the cursor must not pass it) until the rest arrives,
+	// or it becomes two entries.
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("line one\npartial"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	defer os.Remove(tmpfile.Name())
 
-	tmpfile.WriteString("line one\nline two") // no trailing newline
-	tmpfile.Close()
-
-	fs, err := NewFileSource(tmpfile.Name(), "test", 100)
+	fs, err := NewFileSource(path, "test", 100)
 	if err != nil {
 		t.Fatalf("NewFileSource: %v", err)
 	}
 	defer fs.Close()
 
-	entries, _, err := fs.Collect(context.Background(), "")
+	entries, cursor, err := fs.Collect(context.Background(), "")
 	if err != nil {
-		t.Fatalf("Collect: %v", err)
+		t.Fatalf("Collect 1: %v", err)
 	}
-	if len(entries) != 2 {
-		t.Fatalf("got %d entries, want 2 (line one and line two)", len(entries))
+	if len(entries) != 1 || entries[0].Message != "line one" {
+		t.Fatalf("Collect 1 = %v, want only \"line one\"", messages(entries))
 	}
-	if entries[0].Message != "line one" {
-		t.Errorf("entries[0] = %q, want 'line one'", entries[0].Message)
+
+	appendFile(t, path, " rest\nnext\n")
+	entries, _, err = fs.Collect(context.Background(), cursor)
+	if err != nil {
+		t.Fatalf("Collect 2: %v", err)
 	}
-	if entries[1].Message != "line two" {
-		t.Errorf("entries[1] = %q, want 'line two'", entries[1].Message)
+	if got := messages(entries); len(got) != 2 || got[0] != "partial rest" || got[1] != "next" {
+		t.Fatalf("Collect 2 = %q, want [\"partial rest\" \"next\"]", got)
+	}
+
+	// A restarted source resumes from the cursor, before the partial line.
+	fs2, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs2.Close()
+	entries, _, err = fs2.Collect(context.Background(), cursor)
+	if err != nil {
+		t.Fatalf("Collect after restart: %v", err)
+	}
+	if got := messages(entries); len(got) != 2 || got[0] != "partial rest" {
+		t.Fatalf("Collect after restart = %q, want to start at \"partial rest\"", got)
+	}
+}
+
+func TestFileSourceFollowsRenameRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("old 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	entries, cursor, err := fs.Collect(context.Background(), "")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("Collect 1 = %v, %v; want one entry", messages(entries), err)
+	}
+
+	// Lines written to the old file before rotation, including an
+	// unfinished last line, must still be read.
+	appendFile(t, path, "old 2\nold tail")
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	// The new file is longer than the old offset, so a size check alone
+	// would not notice the rotation.
+	if err := os.WriteFile(path, []byte("new 1 with a longer line\nnew 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for i := 0; i < 3; i++ {
+		entries, cursor, err = fs.Collect(context.Background(), cursor)
+		if err != nil {
+			t.Fatalf("Collect after rotation: %v", err)
+		}
+		got = append(got, messages(entries)...)
+	}
+	want := []string{"old 2", "old tail", "new 1 with a longer line", "new 2"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("after rotation got %q, want %q", got, want)
+	}
+
+	// The committed cursor can still name the old file when the new file
+	// had nothing to read yet; it must not move the new file's position.
+	appendFile(t, path, "new 3\n")
+	entries, _, err = fs.Collect(context.Background(), entriesCursorOld(t, path+".1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messages(entries); len(got) != 1 || got[0] != "new 3" {
+		t.Fatalf("Collect with a stale old-file cursor = %q, want [\"new 3\"]", got)
+	}
+}
+
+func TestFileSourceDeletedFileReadsRestThenErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("one\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	_, cursor, err := fs.Collect(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	appendFile(t, path, "two\n")
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	entries, cursor, err := fs.Collect(context.Background(), cursor)
+	if err != nil || len(entries) != 1 || entries[0].Message != "two" {
+		t.Fatalf("Collect after delete = %q, %v; want the unread line \"two\"", messages(entries), err)
+	}
+	if _, _, err := fs.Collect(context.Background(), cursor); err == nil {
+		t.Fatal("Collect with the file gone and fully read returned no error")
+	}
+
+	if err := os.WriteFile(path, []byte("three\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	entries, _, err = fs.Collect(context.Background(), cursor)
+	if err != nil || len(entries) != 1 || entries[0].Message != "three" {
+		t.Fatalf("Collect after the file returns = %q, %v; want [\"three\"]", messages(entries), err)
+	}
+}
+
+func TestFileSourceRestartAfterRotationReadsNewFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("cursors carry no file identity on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte("old 1\nold 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, cursor, err := fs.Collect(context.Background(), "")
+	fs.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rotated while stopped; the new file is longer than the old offset.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("new 1 is a fairly long line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs2, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs2.Close()
+	entries, _, err := fs2.Collect(context.Background(), cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messages(entries); len(got) != 1 || got[0] != "new 1 is a fairly long line" {
+		t.Fatalf("Collect after restart = %q, want the new file from its start", got)
+	}
+}
+
+func TestFileSourceReadsLegacyOffsetCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "app.log")
+	if err := os.WriteFile(path, []byte("one\ntwo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := NewFileSource(path, "test", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+	entries, _, err := fs.Collect(context.Background(), "4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := messages(entries); len(got) != 1 || got[0] != "two" {
+		t.Fatalf("Collect from legacy cursor \"4\" = %q, want [\"two\"]", got)
+	}
+}
+
+// entriesCursorOld returns a cursor at the end of the rotated file,
+// as the pipeline would hold after delivering its last line.
+func entriesCursorOld(t *testing.T, oldPath string) string {
+	t.Helper()
+	fi, err := os.Stat(oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return formatFileCursor(fi.Size(), fileID(fi))
+}
+
+func messages(entries []*core.LogEntry) []string {
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.Message
+	}
+	return out
+}
+
+func appendFile(t *testing.T, path, text string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(text); err != nil {
+		t.Fatal(err)
 	}
 }

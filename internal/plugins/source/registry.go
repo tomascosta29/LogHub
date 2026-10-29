@@ -38,6 +38,12 @@ func IsBuiltIn(name string) bool {
 	return plugins.IsBuiltIn(name)
 }
 
+// IsRegistered reports whether a factory is registered for the source type.
+func IsRegistered(name string) bool {
+	_, ok := plugins.Lookup(name)
+	return ok
+}
+
 // Create instantiates a source by type name.
 func Create(name string, ctx context.Context, props map[string]interface{}, sh SecretResolver) (core.Source, error) {
 	fn, ok := plugins.Lookup(name)

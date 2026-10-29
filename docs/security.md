@@ -161,30 +161,32 @@ az network nsg rule create \
 
 ## Sensitive MSSQL Field Filtering
 
-Before sending data to Sentinel, filter or transform sensitive fields:
+Remove or mask sensitive fields at the source, before they leave the database. LogHub's processors cannot remove or mask individual fields: the `filter` processor keeps or drops whole records.
 
 ### Recommended Field Filtering
 
 | Field Type | Action | Implementation |
 |------------|--------|----------------|
-| Passwords | EXCLUDE | Remove from SELECT or filter in processor |
-| Credit card numbers | MASK | Tokenize or hash in processor |
-| SSN / National IDs | MASK | Partial masking in processor |
-| API keys | EXCLUDE | Remove from SELECT or filter in processor |
+| Passwords | EXCLUDE | Leave out of `columns` or the query |
+| Credit card numbers | MASK | Tokenize or hash in the query |
+| SSN / National IDs | MASK | Partial masking in the query |
+| API keys | EXCLUDE | Leave out of `columns` or the query |
 | PII (names, emails) | REVIEW | Confirm allowed in Sentinel; apply retention policy |
 
-### Processor Configuration for Filtering
+### Column Allowlist
+
+List the approved columns in the source's `columns` setting. Only those are selected; see [data-governance.md](data-governance.md).
 
 ```yaml
-processors:
-  - type: "filter"
-    filter:
-      exclude_fields:
-        - password
-        - credit_card
-        - ssn
-        - api_key
+source:
+  type: "mssql"
+  mssql:
+    table: "AuditEvents"
+    timestamp_column: "event_time"
+    columns: ["event_time", "id", "event_type", "actor_user", "action", "status"]
 ```
+
+To mask rather than drop a field, select a masked expression in a custom query, as below.
 
 ### Custom Query for Field Restriction
 

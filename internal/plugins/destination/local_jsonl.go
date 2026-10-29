@@ -3,6 +3,7 @@ package destination
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,14 +76,26 @@ func (l *LocalJSONL) Send(ctx context.Context, logs []*core.LogEntry) ([]core.En
 		return nil, fmt.Errorf("local_jsonl destination: send after close")
 	}
 
+	statuses := allSuccess(len(logs))
 	switch l.format {
 	case "sentinel":
-		records, err := BuildSentinelRecords(logs)
-		if err != nil {
-			return nil, err
-		}
-		for _, record := range records {
-			if err := l.enc.Encode(record); err != nil {
+		// An entry with no usable timestamp has no Sentinel record. It is
+		// rejected individually, as the sentinel destination does, so the
+		// pipeline dead-letters it instead of counting it as written.
+		for i, entry := range logs {
+			if entry == nil {
+				statuses[i].Error = errors.Join(errors.New("sentinel payload: nil entry"), core.ErrPoisonPill)
+				continue
+			}
+			if _, err := sentinelTimeGenerated(entry); err != nil {
+				statuses[i].Error = errors.Join(err, core.ErrPoisonPill)
+				continue
+			}
+			records, err := BuildSentinelRecords([]*core.LogEntry{entry})
+			if err != nil {
+				return nil, err
+			}
+			if err := l.enc.Encode(records[0]); err != nil {
 				return nil, fmt.Errorf("local_jsonl destination: failed to write sentinel record: %w", err)
 			}
 		}
@@ -97,7 +110,7 @@ func (l *LocalJSONL) Send(ctx context.Context, logs []*core.LogEntry) ([]core.En
 	if err := l.file.Sync(); err != nil {
 		return nil, fmt.Errorf("local_jsonl destination: failed to sync: %w", err)
 	}
-	return allSuccess(len(logs)), nil
+	return statuses, nil
 }
 
 func (l *LocalJSONL) Close() error {
