@@ -68,7 +68,7 @@ func newOracleGenerator() *oracleGenerator {
 }
 
 // next builds the next record. Sizes deliberately vary so field handling,
-// unicode and multi-kilobyte values are exercised by every campaign.
+// unicode and multi-kilobyte values are exercised by every scenario.
 func (g *oracleGenerator) next() oracleRecord {
 	g.mu.Lock()
 	defer g.mu.Unlock()

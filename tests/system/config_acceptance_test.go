@@ -162,3 +162,46 @@ func assertValidateMatchesStart(t *testing.T, cfgPath string, wantStart bool) {
 		t.Fatalf("invalid config exited with status 0")
 	}
 }
+
+// TestValidateDoesNotAcceptUnresolvableSecrets checks the other direction of
+// the validation invariant: --validate must reject a config that the runtime
+// cannot start because a strict secret reference is unresolvable.
+func TestValidateDoesNotAcceptUnresolvableSecrets(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "in.log")
+	if err := os.WriteFile(input, []byte("[INFO] x\n"), 0o600); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	cfg := filepath.Join(dir, "loghub.yaml")
+	content := `
+global:
+  checkpoints_dir: "` + filepath.Join(dir, "cp") + `"
+  strict_resolution: true
+  secret_refresh_interval: "0"
+pipelines:
+  - id: p
+    runtime: {poll_interval: 20ms, shutdown_timeout: 1s}
+    source:
+      type: file
+      file:
+        path: "${env:LOGHUB_TEST_MISSING_SECRET}"
+    destinations: [{type: dummy, dummy: {}}]
+`
+	if err := os.WriteFile(cfg, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if _, stderr, code := runBinary(t, "--validate", "--config", cfg); code != 0 {
+		t.Logf("--validate rejected the unresolvable secret (expected behaviour): %s", stderr)
+		return
+	}
+	proc := startProc(t, cfg)
+	code, exited, logs := proc.exitedWithin(2 * time.Second)
+	if !exited {
+		proc.stop()
+		t.Fatalf("--validate accepted a config with an unresolvable strict secret, and the runtime started instead of failing")
+	}
+	if code == 0 {
+		t.Fatalf("--validate accepted an unresolvable strict secret and the runtime exited 0\n%s", logs)
+	}
+}

@@ -18,7 +18,7 @@ import (
 )
 
 // envInt reads a positive integer setting, falling back to def. Gated
-// campaigns use this so the same test runs cheaply in CI and with large
+// These settings let the same test run cheaply in CI and with large
 // parameters on a qualification run.
 func envInt(name string, def int) int {
 	raw := os.Getenv(name)
