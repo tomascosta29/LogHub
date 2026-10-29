@@ -51,6 +51,9 @@ func (p *Pipeline) pull() error {
 
 	entries, nextCursor, err := p.Source.Collect(p.ctx, cursor)
 	if err != nil {
+		if p.ctx.Err() == nil {
+			metrics.CollectErrors.WithLabelValues(p.ID, p.Source.Name()).Inc()
+		}
 		p.mu.Lock()
 		p.health.LastError = time.Now()
 		p.health.ErrorMsg = err.Error()

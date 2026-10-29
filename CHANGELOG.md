@@ -4,6 +4,53 @@ All notable changes to LogHub are recorded here, newest first, grouped into the 
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **A processor that cannot be built now fails its pipeline.** An unknown processor type, or one whose settings are invalid, was logged and skipped, and the pipeline ran without it, so a filter meant to remove records could be missing while `/health` was green. The pipeline now fails to build, as it does for a bad source or destination. `--validate` also reports unknown source, destination and processor types. Check the startup log for `Failed to create processor` before upgrading.
+- **Pipeline IDs can no longer contain `/`, `\` or control characters, or be `.` or `..`.** The ID names the pipeline's checkpoint, disk-buffer and DLQ files, so such an ID placed them outside their directory. Rename the pipeline; its state files use the new ID.
+- **`json_parse.target_field` accepts only `fields` (the default) and `message`.** Other values were silently treated as `fields`.
+
+### Security
+
+- **HTTP destination errors no longer include the response body.** A destination that echoed the request put tokens or log content into LogHub's logs and DLQ records. Errors now give the status, the request ID header and, for Azure Monitor's JSON errors, the error code.
+- **The HTTP destination no longer follows redirects.** For 301, 302 and 303, Go re-sends a POST as a GET without its body, so a redirected batch was counted as delivered although nothing was ingested. A 3xx is now a failed send, retried and then kept or dead-lettered like any other; set `url` to the final address.
+- **A second LogHub instance no longer removes the first one's lock file.** A failed lock acquisition deleted the lock path, so a third instance could lock a new file and run alongside the first on the same checkpoints, disk buffer and DLQ.
+
+### Changed
+
+- **The file source holds an unfinished last line until its newline arrives.** It was emitted straight away, so a line still being written became two entries. A last line with no newline is delivered once the file is rotated away.
+- **A config reload is all-or-nothing.** If any pipeline in the new config fails to build, the reload fails and the current pipelines keep running, as `docs/failure-modes.md` describes; before, the pipelines that built replaced all of them. If a new pipeline fails to start, the previous config is restored.
+- **`/health` clears a pipeline's `ErrorMsg` once it is back to `running`.** `LastError` keeps the time of the last error. A new `StartedAt` field reports when the pipeline started.
+- HTTP 401, 403, 404 and 413 errors now say what to check (credentials, `url`, `send_batch_size`). They are still retried, then kept or dead-lettered.
+- `X-LogSource` on HTTP and Sentinel requests now carries the source's `name`. It was always empty.
+- `tenant_id` on a Key Vault secret provider now applies when no `client_id` is set: it selects the tenant for `DefaultAzureCredential`. With `client_id`, a managed identity is used, which always authenticates in its own tenant; `tenant_id` is then ignored with a warning.
+
+### Removed
+
+- The `syslog` source schema. It had no implementation: a syslog config passed `--validate` and failed at startup.
+
+### Fixed
+
+- **`poll_interval` or `shutdown_timeout` of zero or less is rejected.** It passed validation, and a zero or negative `poll_interval` then crashed LogHub when the pipeline started.
+- **File rotation by rename is followed.** After logrotate renamed `app.log` and created a new one, the source kept reading the old file. It now reads the rest of the old file, then the new one from the start, including after a restart. A deleted file is read to its end and then reported as a source error until it reappears.
+- **A source that fails from startup now becomes `stalled`.** Stall detection measured from the last successful read or send, so a pipeline that never had one stayed `degraded` and `/health` returned 200. It now measures from the pipeline's start, and so does `health_staleness_threshold`.
+- **Splitting a page into send batches no longer risks skipping an entry on restart.** When the last entry of a send batch had no cursor, the batch committed the next entry's cursor, which skipped that entry if LogHub restarted before sending it. Send batches now end at an entry that has a cursor. Built-in sources give every entry a cursor, so this affected custom sources.
+- **`local_jsonl` with `format: sentinel` reports entries it cannot write.** Entries without a usable timestamp were skipped but counted as written; they are now rejected individually and dead-lettered, as the `sentinel` destination does.
+- **`dummy.drop_rate` works.** It was ignored. It now rejects that fraction of entries, chosen at random, and must be between 0 and 1. The dummy's `latency` no longer delays shutdown.
+- `sqlite` sources with a `query` and no `table` pass validation; the schema required `table` although the source supports query-only configs, as `mssql` does.
+- **`LogHubCollectionErrors` can now fire on source failures.** It watched `loghub_entries_failed_total`, which only counts destination failures, so a failing source incremented no counter. New counter `loghub_collect_errors_total{pipeline_id, source_name}` counts failed source reads, and the alert now uses it. If you copied the alert rules from `docs/monitoring.md`, update `LogHubCollectionErrors`.
+- **Entries rejected by a destination now degrade the pipeline.** Per-entry rejections (for example HTTP 400) were counted and dead-lettered or dropped, but the pipeline stayed `running` with no `LastError`. It now reports `degraded` with the rejection in `ErrorMsg`.
+- **Monitoring observability.** `loghub_circuit_breaker_state` is now published as `0` (closed) when a pipeline is built, instead of only after the breaker's first transition. The monitoring guide now documents `destination_type` on `loghub_retries_total` and the actual `/health` stall/staleness semantics.
+- Docs: `docs/failure-modes.md` said a Sentinel 400 without a DLQ is retried; the entries are dropped and counted. It also said a failed DLQ write after a processor error loses data; the batch is kept.
+- Docs: the field-filtering example in `docs/security.md` used `filter.exclude_fields` as a list of fields to remove. No processor removes or masks fields; the section now uses the SQL sources' `columns` allowlist and custom queries.
+- Docs: `buffer_size` is the capacity of the in-memory page queue, in pages, and does not change memory use or throughput, since a pipeline reads at most one page ahead. The sizing advice in `docs/production-sentinel.md` is about `fetch_size`.
+- Docs: the `global.data_dir` description no longer says it holds checkpoints; they use `checkpoints_dir`.
+
+### Migration Changes
+
+- **File source cursors now record which file they belong to**, as `<offset>@<device>:<inode>` on Linux and macOS, so a rotation while LogHub is stopped is detected on restart. Cursors from earlier releases (a plain offset) are still read, and apply to the file at the path. On Windows, cursors stay a plain offset.
+- A v0.1.0 `<pipeline_id>.cursor` file is now renamed to `<pipeline_id>.cursor.migrated` after it is imported, as the docs and this changelog said; it was deleted.
+
 ## [1.1.0] - 2026-10-29
 
 First public release, under the Apache License 2.0.

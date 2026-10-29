@@ -7,6 +7,7 @@ package bootstrap
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -122,10 +123,33 @@ func (a *App) Close() error {
 	return firstErr
 }
 
+// ValidatePluginTypes checks that every source, destination and processor
+// type in cfg has a registered factory. config.Load cannot check this,
+// because the config package does not import the plugins; without it, a
+// misspelled type passes --validate and fails only at startup.
+func ValidatePluginTypes(cfg *config.Config) error {
+	for _, pc := range cfg.Pipelines {
+		if !source.IsRegistered(pc.Source.Type) {
+			return fmt.Errorf("pipeline %s: unknown source type %q", pc.ID, pc.Source.Type)
+		}
+		for _, dc := range pc.Destinations {
+			if !destination.IsRegistered(dc.Type) {
+				return fmt.Errorf("pipeline %s: unknown destination type %q", pc.ID, dc.Type)
+			}
+		}
+		for _, proc := range pc.Processors {
+			if !processor.IsRegistered(proc.Type) {
+				return fmt.Errorf("pipeline %s: unknown processor type %q", pc.ID, proc.Type)
+			}
+		}
+	}
+	return nil
+}
+
 // buildPipelines constructs each configured pipeline and registers it with
 // the orchestrator. It logs and skips pipelines that fail to build.
 func (a *App) buildPipelines(ctx context.Context) error {
-	pipelines, err := a.buildPipelineList(ctx, a.Config, a.Checkpointer, a.secretHolder)
+	pipelines, err := a.buildPipelineList(ctx, a.Config, a.Checkpointer, a.secretHolder, false)
 	if err != nil {
 		return err
 	}
@@ -136,8 +160,11 @@ func (a *App) buildPipelines(ctx context.Context) error {
 }
 
 // buildPipelineList constructs pipelines from the given config without
-// registering them with an orchestrator. Used by the reload path.
-func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *checkpointer.FileCheckpointer, sh secrets.Resolver) ([]*pipeline.Pipeline, error) {
+// registering them with an orchestrator. At startup (allOrNothing false)
+// a pipeline that fails to build is skipped; on reload (allOrNothing
+// true) any failure fails the whole build, so the running pipelines are
+// kept instead of being replaced by a partial set.
+func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *checkpointer.FileCheckpointer, sh secrets.Resolver, allOrNothing bool) ([]*pipeline.Pipeline, error) {
 	var failedPipelines []string
 	var succeededPipelines []string
 	var pipelines []*pipeline.Pipeline
@@ -177,6 +204,10 @@ func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *che
 				destFailed = true
 				break
 			}
+			// HTTP-based destinations send the source name in X-LogSource.
+			if named, ok := dest.(interface{ SetSourceName(string) }); ok {
+				named.SetSourceName(src.Name())
+			}
 			destClosers = append(destClosers, dest)
 			dests = append(dests, pipeline.DestinationInfo{
 				Destination: dest,
@@ -196,14 +227,27 @@ func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *che
 			continue
 		}
 
+		// A processor that cannot be built fails the whole pipeline, like a
+		// source or destination. Running without it would deliver records
+		// that a filter was meant to remove.
 		var procs []core.Processor
+		procFailed := false
 		for _, procConfig := range pc.Processors {
 			proc, err := processor.Create(procConfig.Type, procConfig.Properties)
 			if err != nil {
 				slog.Error("Failed to create processor for pipeline", "pipeline_id", pc.ID, "type", procConfig.Type, "error", err)
-				continue
+				procFailed = true
+				break
 			}
 			procs = append(procs, proc)
+		}
+		if procFailed {
+			src.Close()
+			for _, d := range destClosers {
+				d.Close()
+			}
+			failedPipelines = append(failedPipelines, pc.ID)
+			continue
 		}
 
 		settings, err := BuildPipelineSettings(&cfg.Global, &pc)
@@ -217,7 +261,7 @@ func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *che
 			continue
 		}
 
-		diskBuf, dlqWriter, err := a.buildDurability(pc, src, destClosers, cp)
+		diskBuf, dlqWriter, err := buildDurability(cfg, pc, src, destClosers, cp)
 		if err != nil {
 			failedPipelines = append(failedPipelines, pc.ID)
 			continue
@@ -231,15 +275,21 @@ func (a *App) buildPipelineList(ctx context.Context, cfg *config.Config, cp *che
 	if len(succeededPipelines) == 0 {
 		return nil, fmt.Errorf("no pipelines were successfully configured; failed=%v", failedPipelines)
 	}
+	if allOrNothing && len(failedPipelines) > 0 {
+		for _, p := range pipelines {
+			if err := p.Close(); err != nil {
+				slog.Error("Error closing pipeline that was not started", "pipeline_id", p.ID, "error", err)
+			}
+		}
+		return nil, fmt.Errorf("some pipelines failed to configure; failed=%v", failedPipelines)
+	}
 	if len(failedPipelines) > 0 {
 		slog.Warn("Some pipelines failed to configure and were skipped", "failed", failedPipelines, "succeeded", succeededPipelines)
 	}
 	return pipelines, nil
 }
 
-func (a *App) buildDurability(pc config.PipelineConfig, src core.Source, destClosers []core.Destination, cp core.Checkpointer) (*buffer.DiskBuffer, *dlq.DeadLetterQueue, error) {
-	cfg := a.Config
-
+func buildDurability(cfg *config.Config, pc config.PipelineConfig, src core.Source, destClosers []core.Destination, cp core.Checkpointer) (*buffer.DiskBuffer, *dlq.DeadLetterQueue, error) {
 	var diskBuf *buffer.DiskBuffer
 	var dlqWriter *dlq.DeadLetterQueue
 
@@ -381,8 +431,6 @@ func (a *App) buildReloadFunc(ctx context.Context) func() error {
 		if err != nil {
 			return fmt.Errorf("failed to reload config: %w", err)
 		}
-		a.Config = cfg
-		a.reloadOnSecretChange.Store(cfg.Global.ReloadOnSecretChange)
 
 		if changed, err := a.secretHolder.Refresh(ctx); err != nil {
 			slog.Warn("Some secrets could not be looked up; using their last resolved values", "error", err)
@@ -390,15 +438,27 @@ func (a *App) buildReloadFunc(ctx context.Context) func() error {
 			slog.Info("Reload picked up changed secrets", "secrets", changed)
 		}
 
-		pipelines, err := a.buildPipelineList(ctx, cfg, a.Checkpointer, a.secretHolder)
+		pipelines, err := a.buildPipelineList(ctx, cfg, a.Checkpointer, a.secretHolder, true)
 		if err != nil {
 			return fmt.Errorf("failed to rebuild pipelines: %w", err)
 		}
 
 		if err := a.Orchestrator.ReplacePipelines(pipelines); err != nil {
-			return fmt.Errorf("failed to replace pipelines: %w", err)
+			// The old pipelines are already stopped and closed, so they
+			// are rebuilt from the previous config.
+			slog.Error("New pipelines failed to start; restoring the previous configuration", "error", err)
+			previous, buildErr := a.buildPipelineList(ctx, a.Config, a.Checkpointer, a.secretHolder, false)
+			if buildErr != nil {
+				return errors.Join(fmt.Errorf("failed to replace pipelines: %w", err), fmt.Errorf("failed to restore previous pipelines: %w", buildErr))
+			}
+			if restoreErr := a.Orchestrator.ReplacePipelines(previous); restoreErr != nil {
+				return errors.Join(fmt.Errorf("failed to replace pipelines: %w", err), fmt.Errorf("failed to restore previous pipelines: %w", restoreErr))
+			}
+			return fmt.Errorf("failed to replace pipelines; previous configuration restored: %w", err)
 		}
 
+		a.Config = cfg
+		a.reloadOnSecretChange.Store(cfg.Global.ReloadOnSecretChange)
 		return nil
 	}
 }

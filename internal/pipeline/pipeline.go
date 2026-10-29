@@ -118,6 +118,10 @@ const (
 )
 
 type PipelineHealth struct {
+	// StartedAt is when the pipeline last started. It is the baseline for
+	// stall and staleness checks until the first successful read or send,
+	// so a source that fails from startup still becomes stalled.
+	StartedAt   time.Time
 	LastCollect time.Time
 	LastSend    time.Time
 	LastError   time.Time
@@ -296,6 +300,16 @@ func NewPipeline(
 		// respect the configured thresholds.
 		applyBreakerSettings(destinations[i].Breaker, settings)
 		destinations[i].Breaker.OnStateChange = breakerMetricHook(id, destTypeOf(destinations[i].Destination))
+		// Publish the initial state so dashboards see a closed breaker
+		// (0) before it has ever tripped. The hook only fires on
+		// transitions, so without this the series would be absent.
+		metrics.CircuitBreakerState.WithLabelValues(id, destTypeOf(destinations[i].Destination)).Set(float64(destinations[i].Breaker.State()))
+	}
+	// Publish the collect-error counter at 0 for the same reason: rate()
+	// and increase() cannot see the first error of a series that does not
+	// exist yet.
+	if source != nil {
+		metrics.CollectErrors.WithLabelValues(id, source.Name()).Add(0)
 	}
 
 	return &Pipeline{
@@ -390,6 +404,7 @@ func (p *Pipeline) Start(parentCtx context.Context) error {
 		return errors.New("pipeline already running")
 	}
 	p.running = true
+	p.health.StartedAt = time.Now()
 	p.ctx, p.cancel = context.WithCancel(parentCtx)
 	p.pushCtx, p.cancelPush = context.WithCancel(context.WithoutCancel(parentCtx))
 	p.mu.Unlock()
@@ -467,6 +482,7 @@ func (p *Pipeline) evaluateStatus(now time.Time) {
 	lastCollect := p.health.LastCollect
 	lastSend := p.health.LastSend
 	lastError := p.health.LastError
+	startedAt := p.health.StartedAt
 	p.mu.Unlock()
 
 	switch cur {
@@ -475,7 +491,7 @@ func (p *Pipeline) evaluateStatus(now time.Time) {
 		return
 	}
 
-	var lastActivity time.Time
+	lastActivity := startedAt
 	switch {
 	case !lastCollect.IsZero() && !lastSend.IsZero():
 		if lastCollect.After(lastSend) {
@@ -500,6 +516,17 @@ func (p *Pipeline) evaluateStatus(now time.Time) {
 	default:
 		// Recent activity, no recent error: running.
 		next = PipelineStatusRunning
+	}
+	if next == PipelineStatusRunning && !lastError.IsZero() {
+		// The error is older than the stall window and the pipeline has
+		// recovered: clear its message so /health does not show it as
+		// current. LastError keeps the time. Skip it if a new error was
+		// recorded since the snapshot above.
+		p.mu.Lock()
+		if p.health.LastError.Equal(lastError) {
+			p.health.ErrorMsg = ""
+		}
+		p.mu.Unlock()
 	}
 	p.SetStatus(next)
 }
@@ -539,6 +566,41 @@ var ErrShutdownTimeout = errors.New("shutdown timed out")
 // on top and is not bounded here.
 func (p *Pipeline) MaxStopDuration() time.Duration {
 	return p.settings.ShutdownTimeout + shutdownGrace
+}
+
+// Close releases the source, destinations, disk buffer and DLQ of a
+// pipeline that was built but never started, such as one discarded by a
+// failed reload. A started pipeline releases them in Stop; Close on it
+// returns an error and changes nothing.
+func (p *Pipeline) Close() error {
+	p.mu.Lock()
+	running := p.running
+	p.mu.Unlock()
+	if running {
+		return errors.New("pipeline is running; use Stop")
+	}
+	var errs []error
+	if p.Source != nil {
+		if err := p.Source.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close source: %w", err))
+		}
+	}
+	for _, dest := range p.Destinations {
+		if err := dest.Destination.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close destination %s: %w", dest.Destination.Type(), err))
+		}
+	}
+	if p.diskBuffer != nil {
+		if err := p.diskBuffer.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close disk buffer: %w", err))
+		}
+	}
+	if p.dlq != nil {
+		if err := p.dlq.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close DLQ: %w", err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Stop stops the pipeline within its shutdown_timeout. See StopContext.

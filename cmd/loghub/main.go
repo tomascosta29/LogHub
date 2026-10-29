@@ -60,6 +60,9 @@ func run(configPath, metricsAddr string, validateOnly bool) error {
 	}
 	slog.Info("Loaded configuration", "version", version, "config", configPath, "pipelines", len(cfg.Pipelines), "log_level", cfg.Global.LogLevel)
 	if validateOnly {
+		if err := bootstrap.ValidatePluginTypes(cfg); err != nil {
+			return fmt.Errorf("invalid config: %w", err)
+		}
 		fmt.Printf("config %s is valid\n", configPath)
 		return nil
 	}
@@ -119,6 +122,11 @@ func run(configPath, metricsAddr string, validateOnly bool) error {
 						stale = true
 					}
 					if !ph.LastSend.IsZero() && now.Sub(ph.LastSend) > threshold {
+						stale = true
+					}
+					// No successful read or send since start: measure from
+					// the start time instead.
+					if ph.LastCollect.IsZero() && ph.LastSend.IsZero() && !ph.StartedAt.IsZero() && now.Sub(ph.StartedAt) > threshold {
 						stale = true
 					}
 					if stale {

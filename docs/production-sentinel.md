@@ -131,18 +131,18 @@ Sentinel's Azure Monitor Logs Ingestion API enforces a 30 MB/minute ingestion qu
 | 200 | 200 | ~2,000 records/sec |
 | 500 | 500 | ~5,000 records/sec (approaching 1MB limit) |
 
-Default `buffer_size` is 100 (set in `setDefaults`, `internal/config/config.go`). This balances MSSQL query cost, cursor pagination overhead, and Sentinel payload limits.
+The source's `fetch_size` (rows per page, default 100) and `runtime.send_batch_size` (records per request) set these sizes. The default page of 100 rows balances MSSQL query cost, cursor pagination overhead, and Sentinel payload limits.
 
 ### Batch Size Justification
 
-The default `buffer_size` of 100 is chosen because:
+The default `fetch_size` of 100 is chosen because:
 
 1. **Payload size**: 100 records at ~200-500 bytes each = 20-50 KB, well within the 1 MB limit
 2. **MSSQL query cost**: `TOP (100)` per poll interval limits row set size and memory pressure
 3. **Cursor accuracy**: Smaller batches reduce the window where duplicate timestamps at boundary conditions could cause missed records
-4. **Pipeline buffer memory**: `buffer_size` controls the in-memory channel capacity; 100 entries × ~1KB each ≈ 100 KB per pipeline
+4. **Pipeline memory**: a pipeline holds at most two pages in memory (one being delivered, one read ahead); 2 × 100 rows × ~1KB ≈ 200 KB per pipeline. `buffer_size`, the page queue's capacity in pages, does not change this.
 
-For high-volume sources (>10,000 events/sec), increasing `buffer_size` to 200-500 is safe if average record size remains under 1 KB.
+For high-volume sources (>10,000 events/sec), increasing `fetch_size` to 200-500 is safe if average record size remains under 1 KB.
 
 ### Poll Interval Recommendations
 
@@ -296,5 +296,5 @@ The cursor contract is validated by `TestMockMSSQLToMockSentinelLargePagedNoDupl
 - [ ] `cursor_column` is unique and stable
 - [ ] Late-arriving record behavior is documented and accepted
 - [ ] MSSQL cursor column index exists for production query volume
-- [ ] `buffer_size` and `poll_interval` tuned to expected event rate
+- [ ] `fetch_size` and `poll_interval` tuned to expected event rate
 - [ ] Retry configuration tested with 429 responses

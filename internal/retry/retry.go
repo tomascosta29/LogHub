@@ -20,11 +20,13 @@ type Retrier struct {
 
 // Do repeatedly calls op until it succeeds, the context is cancelled,
 // the operation returns ErrFatal, or MaxRetries total attempts have been made.
-// MaxRetries is the maximum number of attempts (not initial + retries).
+// MaxRetries is the maximum number of attempts (not initial + retries);
+// zero or less means one attempt, so op is always called at least once.
 // After each failed attempt, it sleeps for BaseBackoff * 2^attempt, capped at 5 minutes.
 func (r *Retrier) Do(ctx context.Context, op func() error) error {
+	attempts := max(r.MaxRetries, 1)
 	var lastErr error
-	for i := 0; i < r.MaxRetries; i++ {
+	for i := 0; i < attempts; i++ {
 		// Check for cancellation before each attempt so we don't call op after
 		// the context is already done.
 		select {

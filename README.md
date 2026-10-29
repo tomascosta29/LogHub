@@ -89,7 +89,7 @@ Sources:
 
 Destinations:
 
-- `sentinel` / `azure_monitor`
+- `sentinel` / `azure_monitor` (two names for the same destination; both report as `sentinel` in metric labels and DLQ records)
 - `http`
 - `local_jsonl`
 - `dummy`
@@ -132,6 +132,7 @@ Before production, run the real Azure canary in `docs/canary-test-plan.md` and c
 | Data governance | [docs/data-governance.md](docs/data-governance.md) |
 | Azure canary test | [docs/canary-test-plan.md](docs/canary-test-plan.md) |
 | Releasing | [docs/releasing.md](docs/releasing.md) |
+| Roadmap | [ROADMAP.md](ROADMAP.md) |
 
 ## Contributing
 

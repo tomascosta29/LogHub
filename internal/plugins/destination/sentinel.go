@@ -211,6 +211,9 @@ func (s *sentinelDestination) Close() error {
 	return s.httpDest.Close()
 }
 
+// Type is "sentinel" for both registered names, sentinel and
+// azure_monitor, so metric labels and DLQ keys do not depend on which
+// alias a config uses.
 func (s *sentinelDestination) Type() string {
 	return "sentinel"
 }

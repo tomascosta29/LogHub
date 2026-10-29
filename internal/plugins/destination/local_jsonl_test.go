@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,5 +104,31 @@ func TestLocalJSONLCloseIsIdempotent(t *testing.T) {
 	}
 	if err := l.Close(); err != nil {
 		t.Errorf("second Close returned %v, want nil (idempotent)", err)
+	}
+}
+
+func TestLocalJSONLRejectsEntriesWithoutTimestamp(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sentinel.jsonl")
+	dest, err := NewLocalJSONL(path, "sentinel")
+	if err != nil {
+		t.Fatalf("NewLocalJSONL failed: %v", err)
+	}
+	defer dest.Close()
+
+	statuses, err := dest.Send(context.Background(), []*core.LogEntry{
+		{Timestamp: time.Date(2026, 5, 6, 12, 0, 1, 0, time.UTC), Message: "ok"},
+		{Message: "no timestamp"},
+	})
+	if err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+	if len(statuses) != 2 || statuses[0].Error != nil {
+		t.Fatalf("statuses = %+v, want the first entry accepted", statuses)
+	}
+	if !errors.Is(statuses[1].Error, core.ErrPoisonPill) {
+		t.Fatalf("entry without a timestamp: status error = %v, want a per-entry rejection", statuses[1].Error)
+	}
+	if records := readJSONLLines(t, path); len(records) != 1 {
+		t.Fatalf("wrote %d records, want 1", len(records))
 	}
 }

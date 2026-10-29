@@ -236,7 +236,12 @@ func (fc *FileCheckpointer) openPipelineLocked(pipelineID string, s *pipelineSta
 				if _, err := j.Append([]byte(cursor)); err == nil {
 					if err := j.Barrier(); err == nil {
 						s.cached = cursor
-						_ = os.Remove(legacyPath)
+						// Keep the old file, renamed, as the disk buffer
+						// and DLQ migrations do: it is the state to restore
+						// when rolling back to v0.1.0.
+						if err := os.Rename(legacyPath, legacyPath+".migrated"); err != nil {
+							slog.Warn("Imported legacy cursor file but could not rename it", "pipeline_id", pipelineID, "file", legacyPath, "error", err)
+						}
 					}
 				}
 			}

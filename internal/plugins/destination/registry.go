@@ -31,6 +31,12 @@ func IsBuiltIn(name string) bool {
 	return plugins.IsBuiltIn(name)
 }
 
+// IsRegistered reports whether a factory is registered for the destination type.
+func IsRegistered(name string) bool {
+	_, ok := plugins.Lookup(name)
+	return ok
+}
+
 // Create instantiates a destination by type name.
 func Create(name string, props map[string]interface{}) (core.Destination, error) {
 	fn, ok := plugins.Lookup(name)

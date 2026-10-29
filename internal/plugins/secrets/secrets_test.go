@@ -390,3 +390,13 @@ func TestCachedSecretHolderCloseStopsRefresh(t *testing.T) {
 		t.Errorf("provider called %d more times after Close", fp.calls-calls)
 	}
 }
+
+func TestDefaultCredentialOptionsUsesTenantID(t *testing.T) {
+	if opts := defaultCredentialOptions(ProviderConfig{}); opts != nil {
+		t.Errorf("options without tenant_id = %+v, want nil", opts)
+	}
+	opts := defaultCredentialOptions(ProviderConfig{TenantID: "tenant-a"})
+	if opts == nil || opts.TenantID != "tenant-a" {
+		t.Errorf("options with tenant_id = %+v, want TenantID tenant-a", opts)
+	}
+}

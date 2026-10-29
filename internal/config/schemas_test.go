@@ -15,15 +15,11 @@ func init() {
 	})
 	RegisterPluginSchema("sqlite", SimplePluginSchema{
 		Allowed:  []string{"database", "table", "query", "timestamp_column", "cursor_column", "name", "fetch_size", "batch_size", "max_lookback", "source_timezone", "max_open_conns", "columns", "wait_for_change"},
-		Required: []string{"database", "table"},
+		Required: []string{"database"},
 	})
 	RegisterPluginSchema("mssql", SimplePluginSchema{
 		Allowed:  []string{"auth", "server", "database", "table", "query", "timestamp_column", "cursor_column", "name", "fetch_size", "batch_size", "max_lookback", "source_timezone", "trust_server_certificate", "max_open_conns", "columns", "wait_for_change", "encrypt"},
 		Required: []string{"server", "database"},
-	})
-	RegisterPluginSchema("syslog", SimplePluginSchema{
-		Allowed:  []string{"network", "address", "buffer_size", "max_size_mb", "timeout"},
-		Required: []string{"network", "address"},
 	})
 	RegisterPluginSchema("http", SimplePluginSchema{
 		Allowed:  []string{"url", "timeout", "headers"},
@@ -57,7 +53,7 @@ func init() {
 	for _, name := range []string{"http", "local_jsonl", "dummy", "sentinel", "azure_monitor"} {
 		destination.RegisterBuiltIn(name)
 	}
-	for _, name := range []string{"file", "sqlite", "mssql", "syslog"} {
+	for _, name := range []string{"file", "sqlite", "mssql"} {
 		source.RegisterBuiltIn(name)
 	}
 	for _, name := range []string{"filter", "json_parse", "timestamp"} {

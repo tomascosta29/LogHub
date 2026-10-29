@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -740,7 +741,7 @@ func (m *errCheckingCheckpointer) Close() error {
 	return nil
 }
 
-func TestProcessorErrorAdvancesCursorEvenWhenDLQFails(t *testing.T) {
+func TestProcessorErrorWithDLQAdvancesCursor(t *testing.T) {
 	originalLogger := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(originalLogger)
@@ -786,6 +787,65 @@ func TestProcessorErrorAdvancesCursorEvenWhenDLQFails(t *testing.T) {
 
 	if len(dest.received) != 0 {
 		t.Fatalf("destination should not have received anything, got %d", len(dest.received))
+	}
+}
+
+// TestFailedDLQWriteKeepsBatch checks the no-loss rule for a DLQ that
+// cannot persist: whether the entries failed in a processor, were
+// rejected by the destination, or failed as a whole batch, the cursor
+// must not move past them and nothing is counted as dropped.
+func TestFailedDLQWriteKeepsBatch(t *testing.T) {
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(originalLogger)
+
+	cases := []struct {
+		name  string
+		procs []core.Processor
+		dest  *mockDestination
+	}{
+		{"processor error", []core.Processor{&failingProcessor{err: errors.New("processor failed")}}, &mockDestination{}},
+		{"entry rejected", nil, &mockDestination{perEntryErrs: []error{errors.New("schema mismatch")}}},
+		{"batch failed", nil, &mockDestination{sendErr: errors.New("destination down")}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dlqWriter, err := dlq.New(t.TempDir(), "dlq-fail", 0)
+			if err != nil {
+				t.Fatalf("failed to create dlq: %v", err)
+			}
+			// A closed DLQ refuses writes, like a full or unwritable disk.
+			dlqWriter.Close()
+
+			src := &mockSource{batch: []*core.LogEntry{{Message: "m"}}, nextCursor: "cursor123"}
+			p := NewPipeline("dlq-fail", src, tc.procs, []DestinationInfo{makeDestInfo(tc.dest, 1)}, &mockCheckpointer{cursor: "start"}, &PipelineSettings{
+				BufferSize:         1,
+				MaxRetries:         1,
+				RetryBaseBackoff:   time.Millisecond,
+				PollInterval:       time.Hour,
+				CheckpointInterval: 0,
+			}, nil, dlqWriter)
+			p.ctx = context.Background()
+			p.cursor.Advance("start")
+			droppedBefore := testutil.ToFloat64(metrics.EntriesDropped.WithLabelValues("dlq-fail", dropProcessorRejected)) +
+				testutil.ToFloat64(metrics.EntriesDropped.WithLabelValues("dlq-fail", dropDestinationRejected))
+
+			if err := p.pull(); err != nil {
+				t.Fatalf("pull failed: %v", err)
+			}
+			retryBatch, _ := p.processBatch(&checkpointState{}, <-p.Buffer)
+			if retryBatch == nil {
+				t.Fatal("processBatch returned no batch to retry; the entries would be lost")
+			}
+			if got := p.cursor.Snapshot(); got != "start" {
+				t.Fatalf("cursor = %q after a failed DLQ write, want it to stay at %q", got, "start")
+			}
+			droppedAfter := testutil.ToFloat64(metrics.EntriesDropped.WithLabelValues("dlq-fail", dropProcessorRejected)) +
+				testutil.ToFloat64(metrics.EntriesDropped.WithLabelValues("dlq-fail", dropDestinationRejected))
+			if droppedAfter != droppedBefore {
+				t.Fatalf("entries_dropped_total grew by %v; nothing was dropped", droppedAfter-droppedBefore)
+			}
+		})
 	}
 }
 
@@ -1126,22 +1186,10 @@ func TestInMemoryPartialFailureSpillsRemainingToDiskBuffer(t *testing.T) {
 	}
 }
 
-func TestSplitBatchFallsBackToNextEntryCursor(t *testing.T) {
-	dest := &mockDestination{}
-	cp := &mockCheckpointer{}
-	p := NewPipeline("test", &mockSource{}, nil, []DestinationInfo{makeDestInfo(dest, 0)}, cp, &PipelineSettings{
-		SendBatchSize:      2,
-		BufferSize:         1,
-		MaxRetries:         1,
-		RetryBaseBackoff:   time.Millisecond,
-		CheckpointInterval: 0,
-	}, nil, nil)
-	p.ctx = context.Background()
-
-	// 5 entries. E2 and E4 have empty Cursor and empty EntryCursors; the
-	// sub-batches ending at E2 and E4 must use a fallback. After this
-	// fix, they should fall back to the next entry's cursor (E3 and E5
-	// respectively).
+func TestSplitBatchEndsSubBatchesAtEntriesWithCursors(t *testing.T) {
+	// E2 and E4 have no cursor. Committing a later entry's cursor after
+	// [E1, E2] would skip that entry on restart, so the split moves to
+	// the nearest entry that has a cursor: [E1] [E2, E3] [E4, E5].
 	batch := Batch{
 		Entries: []*core.LogEntry{
 			{Message: "1", Cursor: "c1"},
@@ -1154,42 +1202,29 @@ func TestSplitBatchFallsBackToNextEntryCursor(t *testing.T) {
 		NextCursor:   "c5",
 	}
 
-	subBatches := splitBatch(batch, p.settings.SendBatchSize)
-	if len(subBatches) != 3 {
-		t.Fatalf("expected 3 sub-batches, got %d", len(subBatches))
+	subBatches := splitBatch(batch, 2)
+	want := []struct {
+		messages string
+		cursor   string
+	}{{"1", "c1"}, {"2,3", "c3"}, {"4,5", "c5"}}
+	if len(subBatches) != len(want) {
+		t.Fatalf("got %d sub-batches, want %d", len(subBatches), len(want))
 	}
-	// Sub-batch 0: [E1, E2] — last entry E2 has no cursor; fall back to
-	// the next entry E3's cursor = "c3".
-	if subBatches[0].NextCursor != "c3" {
-		t.Errorf("sub-batch 0 NextCursor = %q, want %q (fall back to next entry E3)", subBatches[0].NextCursor, "c3")
-	}
-	// Sub-batch 1: [E3, E4] — last entry E4 has no cursor; fall back to
-	// the next entry E5's cursor = "c5".
-	if subBatches[1].NextCursor != "c5" {
-		t.Errorf("sub-batch 1 NextCursor = %q, want %q (fall back to next entry E5)", subBatches[1].NextCursor, "c5")
-	}
-	// Sub-batch 2: [E5] — last entry E5 has cursor "c5"; use it directly.
-	if subBatches[2].NextCursor != "c5" {
-		t.Errorf("sub-batch 2 NextCursor = %q, want %q", subBatches[2].NextCursor, "c5")
+	for i, w := range want {
+		var msgs []string
+		for _, e := range subBatches[i].Entries {
+			msgs = append(msgs, e.Message)
+		}
+		if got := strings.Join(msgs, ","); got != w.messages || subBatches[i].NextCursor != w.cursor {
+			t.Errorf("sub-batch %d = [%s] cursor %q, want [%s] cursor %q", i, got, subBatches[i].NextCursor, w.messages, w.cursor)
+		}
 	}
 }
 
-func TestSplitBatchFallsBackToBatchNextCursor(t *testing.T) {
-	dest := &mockDestination{}
-	cp := &mockCheckpointer{}
-	p := NewPipeline("test", &mockSource{}, nil, []DestinationInfo{makeDestInfo(dest, 0)}, cp, &PipelineSettings{
-		SendBatchSize:      2,
-		BufferSize:         1,
-		MaxRetries:         1,
-		RetryBaseBackoff:   time.Millisecond,
-		CheckpointInterval: 0,
-	}, nil, nil)
-	p.ctx = context.Background()
-
-	// 3 entries, all with empty cursors. Sub-batches [E1, E2] and [E3].
-	// [E1, E2] has no "next entry" (it's not the last sub-batch) — wait,
-	// actually there IS a next entry (E3) which also has no cursor. So
-	// both fall back to batch.NextCursor = "end".
+func TestSplitBatchWithoutEntryCursorsKeepsOneBatch(t *testing.T) {
+	// No entry has a cursor, so the only safe commit point is the
+	// batch's own NextCursor, after the last entry. Splitting would
+	// commit it before E3 is delivered.
 	batch := Batch{
 		Entries: []*core.LogEntry{
 			{Message: "1", Cursor: ""},
@@ -1200,15 +1235,10 @@ func TestSplitBatchFallsBackToBatchNextCursor(t *testing.T) {
 		NextCursor:   "end",
 	}
 
-	subBatches := splitBatch(batch, p.settings.SendBatchSize)
-	if len(subBatches) != 2 {
-		t.Fatalf("expected 2 sub-batches, got %d", len(subBatches))
-	}
-	if subBatches[0].NextCursor != "end" {
-		t.Errorf("sub-batch 0 NextCursor = %q, want %q (fall back to batch.NextCursor)", subBatches[0].NextCursor, "end")
-	}
-	if subBatches[1].NextCursor != "end" {
-		t.Errorf("sub-batch 1 NextCursor = %q, want %q (fall back to batch.NextCursor)", subBatches[1].NextCursor, "end")
+	subBatches := splitBatch(batch, 2)
+	if len(subBatches) != 1 || len(subBatches[0].Entries) != 3 || subBatches[0].NextCursor != "end" {
+		t.Fatalf("got %d sub-batches (first has %d entries, cursor %q), want one batch of 3 with cursor \"end\"",
+			len(subBatches), len(subBatches[0].Entries), subBatches[0].NextCursor)
 	}
 }
 
@@ -1640,6 +1670,70 @@ func TestPipelineStalledDetection_NoActivity(t *testing.T) {
 
 	if got := p.Status(); got != PipelineStatusStalled {
 		t.Fatalf("status after no activity = %v, want Stalled", got)
+	}
+}
+
+func TestPipelineStallsWithoutAnySuccessSinceStart(t *testing.T) {
+	// A source that fails from the first read never sets LastCollect or
+	// LastSend. The start time is the baseline, so the pipeline still
+	// stalls once the window passes, instead of staying degraded.
+	p := newTestPipeline("test", &PipelineSettings{
+		PollInterval:               10 * time.Millisecond,
+		BufferSize:                 1,
+		StalledThresholdMultiplier: 3,
+	})
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	defer p.cancel()
+
+	p.SetStatus(PipelineStatusRunning)
+	t0 := time.Now()
+	p.mu.Lock()
+	p.health.StartedAt = t0
+	p.health.LastError = t0.Add(time.Second)
+	p.mu.Unlock()
+
+	p.evaluateStatus(t0.Add(10 * time.Millisecond))
+	if got := p.Status(); got == PipelineStatusStalled {
+		t.Fatalf("status inside the stall window = %v, want not stalled", got)
+	}
+	p.evaluateStatus(t0.Add(time.Second))
+	if got := p.Status(); got != PipelineStatusStalled {
+		t.Fatalf("status with no success since start = %v, want Stalled", got)
+	}
+}
+
+func TestRecoveredPipelineClearsErrorMessage(t *testing.T) {
+	p := newTestPipeline("test", &PipelineSettings{
+		PollInterval:               10 * time.Millisecond,
+		BufferSize:                 1,
+		StalledThresholdMultiplier: 3,
+	})
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	defer p.cancel()
+
+	p.SetStatus(PipelineStatusRunning)
+	t0 := time.Now()
+	p.mu.Lock()
+	p.health.LastError = t0
+	p.health.ErrorMsg = "destination down"
+	p.health.LastCollect = t0
+	p.mu.Unlock()
+
+	p.evaluateStatus(t0.Add(5 * time.Millisecond))
+	if h := p.Health(); h.Status != PipelineStatusDegraded || h.ErrorMsg == "" {
+		t.Fatalf("with a recent error: status %v, ErrorMsg %q; want degraded with the message", h.Status, h.ErrorMsg)
+	}
+
+	p.mu.Lock()
+	p.health.LastCollect = t0.Add(time.Second)
+	p.mu.Unlock()
+	p.evaluateStatus(t0.Add(time.Second))
+	h := p.Health()
+	if h.Status != PipelineStatusRunning || h.ErrorMsg != "" {
+		t.Fatalf("after recovery: status %v, ErrorMsg %q; want running with no message", h.Status, h.ErrorMsg)
+	}
+	if !h.LastError.Equal(t0) {
+		t.Fatalf("LastError = %v, want it kept at %v", h.LastError, t0)
 	}
 }
 

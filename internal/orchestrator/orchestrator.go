@@ -15,6 +15,8 @@ import (
 )
 
 type Orchestrator struct {
+	// pipelines is guarded by mu: /health reads it while a reload
+	// replaces it.
 	pipelines    []*pipeline.Pipeline
 	wg           sync.WaitGroup
 	ctx          context.Context
@@ -50,21 +52,37 @@ func (o *Orchestrator) RequestReload() {
 }
 
 func (o *Orchestrator) AddPipeline(p *pipeline.Pipeline) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	o.pipelines = append(o.pipelines, p)
 }
 
-// ReplacePipelines stops all existing pipelines, clears the list, and
-// installs the provided set. It is used by the SIGHUP reload path.
+// snapshot returns a copy of the pipeline list.
+func (o *Orchestrator) snapshot() []*pipeline.Pipeline {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]*pipeline.Pipeline(nil), o.pipelines...)
+}
+
+// ReplacePipelines stops all existing pipelines and starts the provided
+// set in their place. It is used by the reload path. The old pipelines
+// are stopped first because the new ones reuse their checkpoints, disk
+// buffers and DLQs.
+//
+// If a new pipeline fails to start, the ones already started are
+// stopped, the rest are closed, and the orchestrator is left with no
+// pipelines; the caller restores the previous configuration.
 func (o *Orchestrator) ReplacePipelines(pipelines []*pipeline.Pipeline) error {
 	o.mu.Lock()
 	if !o.running {
 		o.mu.Unlock()
 		return errors.New("orchestrator not running")
 	}
+	old := o.pipelines
 	o.mu.Unlock()
 
 	var wg sync.WaitGroup
-	for _, p := range o.pipelines {
+	for _, p := range old {
 		wg.Add(1)
 		go func(p *pipeline.Pipeline) {
 			defer wg.Done()
@@ -73,11 +91,24 @@ func (o *Orchestrator) ReplacePipelines(pipelines []*pipeline.Pipeline) error {
 	}
 	wg.Wait()
 
+	o.mu.Lock()
 	o.pipelines = pipelines
+	o.mu.Unlock()
 
-	for _, p := range o.pipelines {
+	for i, p := range pipelines {
 		if err := p.Start(o.ctx); err != nil {
-			return err
+			for _, sp := range pipelines[:i] {
+				sp.Stop()
+			}
+			for _, up := range pipelines[i:] {
+				if closeErr := up.Close(); closeErr != nil {
+					slog.Error("Error closing pipeline that was not started", "pipeline_id", up.ID, "error", closeErr)
+				}
+			}
+			o.mu.Lock()
+			o.pipelines = nil
+			o.mu.Unlock()
+			return fmt.Errorf("pipeline %s: %w", p.ID, err)
 		}
 	}
 	return nil
@@ -93,6 +124,7 @@ func (o *Orchestrator) Running() bool {
 type PipelineHealth struct {
 	ID          string
 	Status      string
+	StartedAt   time.Time
 	LastCollect time.Time
 	LastSend    time.Time
 	LastError   time.Time
@@ -111,11 +143,12 @@ func (o *Orchestrator) Health() (running bool, uptime time.Duration) {
 // PipelineHealths returns a snapshot of each pipeline's health state.
 func (o *Orchestrator) PipelineHealths() []PipelineHealth {
 	var out []PipelineHealth
-	for _, p := range o.pipelines {
+	for _, p := range o.snapshot() {
 		h := p.Health()
 		out = append(out, PipelineHealth{
 			ID:          p.ID,
 			Status:      string(h.Status),
+			StartedAt:   h.StartedAt,
 			LastCollect: h.LastCollect,
 			LastSend:    h.LastSend,
 			LastError:   h.LastError,
@@ -150,7 +183,7 @@ func (o *Orchestrator) Start() error {
 
 	var started []*pipeline.Pipeline
 
-	for _, p := range o.pipelines {
+	for _, p := range o.snapshot() {
 		if err := p.Start(o.ctx); err != nil {
 			for _, sp := range started {
 				sp.Stop()
@@ -253,18 +286,19 @@ func (o *Orchestrator) Shutdown() error {
 // process can exit within its termination grace period.
 func (o *Orchestrator) ShutdownContext(ctx context.Context) error {
 	slog.Info("Waiting for pipelines to flush buffers...")
+	pipelines := o.snapshot()
 	var budget time.Duration
-	for _, p := range o.pipelines {
+	for _, p := range pipelines {
 		budget = max(budget, p.MaxStopDuration())
 	}
 	ctx, cancel := context.WithTimeout(ctx, budget+shutdownCloseAllowance)
 	defer cancel()
 
-	errs := make([]error, len(o.pipelines))
-	stopped := make([]bool, len(o.pipelines))
+	errs := make([]error, len(pipelines))
+	stopped := make([]bool, len(pipelines))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	for i, p := range o.pipelines {
+	for i, p := range pipelines {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -288,7 +322,7 @@ func (o *Orchestrator) ShutdownContext(ctx context.Context) error {
 	}
 
 	mu.Lock()
-	for i, p := range o.pipelines {
+	for i, p := range pipelines {
 		if !stopped[i] {
 			errs[i] = fmt.Errorf("pipeline %s: did not stop before the shutdown deadline: %w", p.ID, pipeline.ErrShutdownTimeout)
 		}
