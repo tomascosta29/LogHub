@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func collectErrors(id string) float64 {
 // A failed source read is counted in loghub_collect_errors_total, which
 // the LogHubCollectionErrors alert watches.
 func TestCollectErrorIsCounted(t *testing.T) {
-	const id = "collect-errors"
+	id := fmt.Sprintf("collect-errors-%d", time.Now().UnixNano())
 	src := &mockSource{err: errors.New("database unreachable")}
 	p := NewPipeline(id, src, nil, []DestinationInfo{makeDestInfo(&mockDestination{}, 0)}, &mockCheckpointer{}, &PipelineSettings{
 		BufferSize:   1,
