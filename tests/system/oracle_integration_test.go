@@ -85,6 +85,11 @@ func TestOracleTracksSQLiteSourceDelivery(t *testing.T) {
 		Observed:     observedFromLogEntries("local_jsonl", entries),
 	}, "sqlite source")
 
+	// The send counter is updated after the destination returns; wait for
+	// the last batch before reconciling it with the collect counter.
+	waitForMetric(t, proc.addr, "loghub_entries_sent_total",
+		map[string]string{"pipeline_id": "oracle-sqlite", "destination_type": "local_jsonl"},
+		10*time.Second, "all entries counted as sent", func(v float64) bool { return v >= 400 })
 	fams := scrapeMetrics(t, proc.addr)
 	m := pipelineOracleMetrics(t, fams, "oracle-sqlite", "oracle-input", "local_jsonl", 0)
 	for _, err := range reconcile(m) {

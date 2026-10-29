@@ -462,6 +462,11 @@ pipelines:
 		t.Errorf("health Content-Type = %q, want application/json", ct)
 	}
 
+	// The send counter advances before the durable checkpoint completes;
+	// wait for the checkpoint counter so this check does not race the last
+	// fsync.
+	waitForMetric(t, p.addr, "loghub_checkpoints_saved_total", pid, 10*time.Second,
+		"checkpoints caught up with sends", func(v float64) bool { return v >= 6 })
 	fams := scrapeMetrics(t, p.addr)
 	if got := mustValue(t, fams, "loghub_pipeline_running", pid); got != 1 {
 		t.Errorf("loghub_pipeline_running = %v, want 1", got)
