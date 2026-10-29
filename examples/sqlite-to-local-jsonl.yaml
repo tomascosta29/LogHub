@@ -1,0 +1,32 @@
+global:
+  checkpoints_dir: "./data/checkpoints"
+
+pipelines:
+  - id: "sqlite-to-local-jsonl"
+    runtime:
+      poll_interval: "1s"
+      send_batch_size: 100
+      buffer_size: 100
+      shutdown_timeout: "30s"
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+    source:
+      type: "sqlite"
+      sqlite:
+        database: "./data/local-audit.db"
+        table: "audit_events"
+        timestamp_column: "event_time"
+        cursor_column: "id"
+        fetch_size: 100
+    processors:
+      - type: "timestamp"
+        timestamp:
+          source_field: "event_time"
+          source_layout: "2006-01-02T15:04:05Z07:00"
+          target_field: "timestamp"
+    destinations:
+      - type: "local_jsonl"
+        local_jsonl:
+          path: "./data/sentinel-records.jsonl"
+          format: "sentinel"

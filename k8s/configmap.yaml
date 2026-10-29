@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loghub-config
+data:
+  loghub.yaml: |
+    global:
+      data_dir: "/data"
+      checkpoints_dir: "/data/checkpoints"
+      log_level: "info"
+      metrics_enabled: true
+      health_staleness_threshold: "5m"
+      stalled_threshold_multiplier: 5
+    secrets:
+      env:
+        type: "env"
+    pipelines:
+      - id: "example"
+        source:
+          type: "file"
+          file:
+            path: "/data/input.log"
+            name: "example"
+        destinations:
+          - type: "dummy"

@@ -1,0 +1,50 @@
+global:
+  checkpoints_dir: "./data/checkpoints"
+  strict_resolution: true
+
+pipelines:
+  - id: "mssql-audit-to-sentinel"
+    runtime:
+      poll_interval: "10s"
+      send_batch_size: 100
+      buffer_size: 50
+      checkpoint_interval: "30s"
+      shutdown_timeout: "60s"
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+    durability:
+      dlq:
+        enabled: true
+        dir: "./data/dlq/mssql-audit-to-sentinel"
+      disk_buffer:
+        enabled: true
+        dir: "./data/buffer/mssql-audit-to-sentinel"
+        max_size_mb: 2048
+    source:
+      type: "mssql"
+      mssql:
+        server: "your-sql-server.database.windows.net"
+        database: "AuditDB"
+        table: "AuditEvents"
+        timestamp_column: "event_time"
+        cursor_column: "id"
+        fetch_size: 100
+        max_lookback: "5m"
+        source_timezone: "Europe/Berlin"
+        auth:
+          method: "ad-managed-identity"
+    processors:
+      - type: "timestamp"
+        timestamp:
+          source_field: "event_time"
+          source_layout: "2006-01-02T15:04:05Z07:00"
+          target_field: "timestamp"
+    destinations:
+      - type: "sentinel"
+        max_retries: 4
+        sentinel:
+          dce: "https://your-dce-name.eastus.ingest.monitor.azure.com"
+          dcr: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          stream: "Custom-MSSQLAudit_CL"
+          timeout: "30s"

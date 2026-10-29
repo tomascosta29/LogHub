@@ -1,0 +1,78 @@
+# The checks described in CONTRIBUTING.md. Actions are pinned to commit SHAs;
+# the comment names the release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The go.mod minimum and the release the image is built with.
+        go: ["1.26.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+      - run: make fmt-check
+      - run: make vet
+      - run: go test ./... -count=1
+      - run: make race
+      - run: make build
+
+  mssql-live:
+    name: MSSQL live tests
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          # A throwaway container that exists only for this job.
+          MSSQL_SA_PASSWORD: LogHub-CI-1!
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P 'LogHub-CI-1!' -Q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 24
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+      - run: go test ./internal/plugins/source -run Live -count=1 -v
+        env:
+          LOGHUB_MSSQL_TEST_SERVER: localhost:1433
+          LOGHUB_MSSQL_TEST_PASSWORD: LogHub-CI-1!
+
+  vulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+      - run: make vulncheck
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build --build-arg VERSION=${{ github.sha }} -t loghub:ci .
+      - run: docker run --rm loghub:ci --version

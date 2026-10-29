@@ -1,0 +1,117 @@
+# LogHub Configuration Example
+#
+# This file shows the preferred schema shape. Legacy plugin `properties` blocks
+# are still accepted, but new configs should use typed sections such as
+# `source.mssql`, `destination.sentinel`, and `processor.timestamp`.
+
+global:
+  checkpoints_dir: "./data/checkpoints"
+  log_level: "info"
+  strict_resolution: false
+  metrics_enabled: true
+
+secrets:
+  env:
+    type: "env"
+  keyvault-dev:
+    type: "keyvault"
+    vault_url: "https://mykeyvault-dev.vault.azure.net/"
+
+pipelines:
+  - id: "file-to-http"
+    runtime:
+      poll_interval: "1s"
+      send_batch_size: 100
+      buffer_size: 100
+      checkpoint_interval: "0"
+      shutdown_timeout: "30s"
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+    durability:
+      dlq:
+        enabled: true
+        dir: "./data/dlq/file-to-http"
+      disk_buffer:
+        enabled: true
+        dir: "./data/buffer/file-to-http"
+        max_size_mb: 1024
+
+    source:
+      type: "file"
+      file:
+        path: "/var/log/app.log"
+        name: "app-server-1"
+        fetch_size: 100
+
+    processors:
+      - type: "filter"
+        filter:
+          include_level: ["ERROR", "WARN"]
+      - type: "json_parse"
+        json_parse:
+          keep_source: true
+          on_error: "keep"
+
+    destinations:
+      - type: "http"
+        max_retries: 4
+        http:
+          url: "https://ingest.example.com/v1/logs"
+          timeout: "30s"
+          headers:
+            Authorization: "Bearer ${env:API_TOKEN}"
+
+  - id: "sqlite-to-dummy"
+    source:
+      type: "sqlite"
+      sqlite:
+        name: "sqlite-app"
+        database: "/path/to/mydatabase.db"
+        table: "AppEvents"
+        timestamp_column: "created_at"
+        cursor_column: "id"
+        fetch_size: 100
+    destinations:
+      - type: "dummy"
+        dummy:
+          log_messages: true
+
+  - id: "mssql-to-sentinel"
+    runtime:
+      poll_interval: "10s"
+      send_batch_size: 100
+      buffer_size: 50
+      checkpoint_interval: "30s"
+      shutdown_timeout: "60s"
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+    source:
+      type: "mssql"
+      mssql:
+        name: "mssql-audit"
+        server: "myserver.database.windows.net"
+        database: "AuditDB"
+        table: "AuditEvents"
+        timestamp_column: "event_time"
+        cursor_column: "id"
+        fetch_size: 100
+        max_lookback: "5m"
+        source_timezone: "Europe/Berlin"
+        auth:
+          method: "ad-managed-identity"
+    processors:
+      - type: "timestamp"
+        timestamp:
+          source_field: "event_time"
+          source_layout: "2006-01-02T15:04:05Z07:00"
+          target_field: "timestamp"
+    destinations:
+      - type: "sentinel"
+        max_retries: 4
+        sentinel:
+          dce: "https://your-dce-name.eastus.ingest.monitor.azure.com"
+          dcr: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          stream: "Custom-MSSQLAudit_CL"
+          timeout: "30s"

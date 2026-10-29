@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loghub
+  labels:
+    app: loghub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: loghub
+  template:
+    metadata:
+      labels:
+        app: loghub
+    spec:
+      # Shutdown takes at most shutdown_timeout (30s) + 5s drain grace +
+      # 5s to close connections. Raise this with shutdown_timeout.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: loghub
+          image: loghub:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config"
+            - "/etc/loghub/loghub.yaml"
+            - "--metrics"
+            - ":9090"
+          ports:
+            - name: metrics
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loghub
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      volumes:
+        - name: config
+          configMap:
+            name: loghub-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: loghub-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loghub-metrics
+  labels:
+    app: loghub
+spec:
+  selector:
+    app: loghub
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: loghub
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: loghub

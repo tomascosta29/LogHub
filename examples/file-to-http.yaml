@@ -1,0 +1,25 @@
+global:
+  checkpoints_dir: "./data/checkpoints"
+
+pipelines:
+  - id: "file-to-http"
+    runtime:
+      poll_interval: "1s"
+      send_batch_size: 100
+      buffer_size: 100
+      shutdown_timeout: "30s"
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+    source:
+      type: "file"
+      file:
+        path: "/var/log/app.log"
+        name: "app"
+        fetch_size: 100
+    destinations:
+      - type: "http"
+        max_retries: 4
+        http:
+          url: "https://ingest.example.com/logs"
+          timeout: "30s"

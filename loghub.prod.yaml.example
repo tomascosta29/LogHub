@@ -1,0 +1,97 @@
+# LogHub Production Configuration Template
+#
+# Sanitized MSSQL / Azure SQL -> Microsoft Sentinel example.
+# Copy to loghub.prod.yaml and replace placeholders before deployment.
+
+global:
+  checkpoints_dir: "/data/loghub/checkpoints"
+  log_level: "info"
+  strict_resolution: true
+  # How often cached secrets are looked up again to notice rotation
+  # (default 5m; "0" disables). A changed secret is logged and applies on
+  # the next SIGHUP, or straight away with reload_on_secret_change.
+  secret_refresh_interval: "5m"
+  reload_on_secret_change: false
+  metrics_enabled: true
+  # Idle connection limit for shared HTTP/Sentinel pools (default 100).
+  http_max_idle_conns_per_host: 100
+  # Per-destination circuit breaker. When a destination
+  # has `failure_threshold` consecutive failures, subsequent sends
+  # fail-fast with retry.ErrCircuitOpen and the sub-batch is
+  # routed to the disk buffer. After `recovery_timeout` the breaker
+  # admits a single half-open probe; on success it closes, on
+  # failure it re-opens for another full cool-off window.
+  circuit_breaker_failure_threshold: 5
+  circuit_breaker_recovery_timeout: "30s"
+  circuit_breaker_half_open_max_calls: 1
+
+secrets:
+  keyvault-prod:
+    type: "keyvault"
+    vault_url: "https://your-keyvault-name.vault.azure.net/"
+    # client_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  env:
+    type: "env"
+
+pipelines:
+  - id: "mssql-audit-to-sentinel"
+    runtime:
+      poll_interval: "10s"
+      send_batch_size: 100
+      buffer_size: 50
+      checkpoint_interval: "30s"
+      shutdown_timeout: "60s"
+
+    retry:
+      max_attempts: 4
+      base_backoff: "1s"
+
+    durability:
+      dlq:
+        enabled: true
+        dir: "/data/loghub/dlq/mssql-audit-to-sentinel"
+      disk_buffer:
+        enabled: true
+        dir: "/data/loghub/buffer/mssql-audit-to-sentinel"
+        max_size_mb: 2048
+
+    source:
+      type: "mssql"
+      mssql:
+        name: "mssql-audit"
+        server: "your-sql-server.database.windows.net"
+        database: "AuditDB"
+        table: "AuditEvents"
+        timestamp_column: "event_time"
+        cursor_column: "id"
+        fetch_size: 100
+        max_lookback: "5m"
+        source_timezone: "Europe/Berlin"
+        auth:
+          method: "ad-managed-identity"
+
+    processors:
+      - type: "timestamp"
+        timestamp:
+          source_field: "event_time"
+          source_layout: "2006-01-02T15:04:05Z07:00"
+          target_layout: "2006-01-02T15:04:05Z"
+          target_field: "timestamp"
+
+    destinations:
+      - type: "sentinel"
+        max_retries: 4
+        sentinel:
+          dce: "https://your-dce-name.eastus.ingest.monitor.azure.com"
+          dcr: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+          stream: "Custom-MSSQLAudit_CL"
+          timeout: "30s"
+          # client_id: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# Production checklist:
+# - SQL table has an index on (event_time, id).
+# - Managed Identity has SELECT permission on the SQL table.
+# - Managed Identity has Monitoring Metrics Publisher on the DCR.
+# - DCR stream schema matches the flattened payload fields plus TimeGenerated.
+# - Checkpoint, DLQ, and disk buffer directories are on persistent storage.
+# - Run: ./loghub --config loghub.prod.yaml --validate

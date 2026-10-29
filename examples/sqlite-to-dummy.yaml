@@ -1,0 +1,19 @@
+global:
+  checkpoints_dir: "./data/checkpoints"
+
+pipelines:
+  - id: "sqlite-to-dummy"
+    runtime:
+      send_batch_size: 100
+    source:
+      type: "sqlite"
+      sqlite:
+        database: "/path/to/mydatabase.db"
+        table: "AppEvents"
+        timestamp_column: "created_at"
+        cursor_column: "id"
+        fetch_size: 100
+    destinations:
+      - type: "dummy"
+        dummy:
+          log_messages: true

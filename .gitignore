@@ -1,0 +1,28 @@
+# Build outputs
+/loghub
+/bin/
+/dist/
+*.test
+*.out
+
+# Runtime state
+/data/
+*.cursor
+*.buffer
+*.drain
+*.dlq
+*.log
+
+# Local config and secrets
+.env
+.env.*
+*.local.yaml
+*.local.yml
+loghub.yaml
+loghub.prod.yaml
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
