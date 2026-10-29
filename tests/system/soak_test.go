@@ -275,15 +275,18 @@ func TestSoakResourceBehavior(t *testing.T) {
 	done := make(chan struct{})
 	writerErr := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(15 * time.Millisecond)
+		// A modest rate keeps the in-process oracle's own record set
+		// bounded during an 8 h run; the fault and resource behaviour does
+		// not depend on saturating the pipeline.
+		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-ticker.C:
-				fileGen.appendFileQuiet(input, 5)
-				recs := sqlGen.generate(5)
+				fileGen.appendFileQuiet(input, 1)
+				recs := sqlGen.generate(1)
 				if err := insertOracleRows(db, "oracle_events", recs); err != nil {
 					select {
 					case writerErr <- err:

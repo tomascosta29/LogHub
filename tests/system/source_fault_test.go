@@ -266,3 +266,40 @@ func TestFileSourceDeletionWhileStoppedReadsTheReplacement(t *testing.T) {
 		Observed:     observedFromLogEntries("local_jsonl", readLogEntriesTolerant(t, output)[20:]),
 	}, "replacement file after deletion")
 }
+
+// TestFileRotationFasterThanPollDoesNotLoseLines rotates the path many
+// times between two polls. A single-path follower only ever sees the file
+// it has open plus the file now at the path, so rotations that complete in
+// between are invisible; this test records whether any line is lost.
+func TestFileRotationFasterThanPollDoesNotLoseLines(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "app.log")
+	output := filepath.Join(dir, "out.jsonl")
+	g := newOracleGenerator()
+	g.appendFile(t, input, 50)
+
+	c := newTestConfig(t)
+	p := oracleFilePipeline("rotation-storm", input, output, 25)
+	p["runtime"].(map[string]any)["poll_interval"] = "200ms"
+	c.add(p)
+	cfg := c.write(t)
+	proc := startProc(t, cfg)
+	waitForPipelineUp(t, proc, "rotation-storm")
+	waitForJSONLCount(t, output, 50, 15*time.Second)
+
+	for i := 0; i < 20; i++ {
+		if err := os.Rename(input, fmt.Sprintf("%s.%02d", input, i)); err != nil {
+			t.Fatalf("rotate %d: %v", i, err)
+		}
+		g.appendFile(t, input, 5)
+		time.Sleep(3 * time.Millisecond)
+	}
+	g.appendFile(t, input, 5)
+
+	waitForAllIDs(t, g, 15*time.Second, output)
+	proc.stop()
+	verifyOracle(t, g, oracleCheck{
+		Destinations: []string{"local_jsonl"},
+		Observed:     observedFromLogEntries("local_jsonl", readLogEntriesTolerant(t, output)),
+	}, "rotation faster than poll")
+}

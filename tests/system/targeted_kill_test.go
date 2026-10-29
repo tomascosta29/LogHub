@@ -67,8 +67,23 @@ func runTargetedKill(t *testing.T, sc string, when int) {
 		proc.kill()
 	}
 
-	// Restart without the fault and drain.
-	proc = startProc(t, cfg)
+	// Restart without the fault and drain. A killed wrapper can take a
+	// moment to release the flock; retry a startup that raced it.
+	var restarted bool
+	for attempt := 0; attempt < 3 && !restarted; attempt++ {
+		proc = startProc(t, cfg)
+		if code, exited, logs := proc.exitedWithin(500 * time.Millisecond); exited {
+			if code != 0 && strings.Contains(logs, "held by another process") {
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			t.Fatalf("restart after %s#%d exited: %d\n%s", sc, when, code, logs)
+		}
+		restarted = true
+	}
+	if !restarted {
+		t.Fatalf("restart after %s#%d could not acquire the lock", sc, when)
+	}
 	waitForPipelineUp(t, proc, "targeted-kill")
 	waitForAllIDs(t, g, 30*time.Second, output)
 	proc.stop()
