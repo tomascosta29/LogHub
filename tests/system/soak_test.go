@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -6,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
@@ -237,6 +240,12 @@ func TestSoakResourceBehavior(t *testing.T) {
 	cfg := &testConfig{dir: dir, Global: global, Pipelines: []map[string]any{pFile, pSQL}}
 	cfg.Global["circuit_breaker_failure_threshold"] = 50
 	cfgPath := cfg.write(t)
+
+	// Keep the test log readable and the run cheap; the soak checks
+	// behaviour, not log volume.
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer slog.SetDefault(previousLogger)
 
 	app, err := bootstrap.NewApp(context.Background(), cfgPath)
 	if err != nil {

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -156,7 +158,7 @@ func TestSIGKILLDuringShutdownDoesNotHang(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	proc.signal(syscall.SIGTERM)
 	time.Sleep(200 * time.Millisecond)
-	if err := syscall.Kill(-proc.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+	if err := killProcess(proc); err != nil {
 		t.Fatalf("sigkill: %v", err)
 	}
 	if _, exited, _ := proc.exitedWithin(5 * time.Second); !exited {

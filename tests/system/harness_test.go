@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -307,7 +309,7 @@ func startProcCommand(t *testing.T, prefix []string, argv []string, env ...strin
 		if p.done {
 			return
 		}
-		_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL)
+		_ = killProcess(p)
 		<-p.waitCh
 		p.logFile.Close()
 		p.done = true
@@ -317,7 +319,7 @@ func startProcCommand(t *testing.T, prefix []string, argv []string, env ...strin
 
 func (p *proc) signal(sig syscall.Signal) {
 	p.t.Helper()
-	if err := syscall.Kill(-p.cmd.Process.Pid, sig); err != nil {
+	if err := signalProcess(p, sig); err != nil {
 		p.t.Fatalf("signal %v: %v", sig, err)
 	}
 }
@@ -358,7 +360,7 @@ func (p *proc) stop() {
 
 func (p *proc) kill() (int, string) {
 	p.t.Helper()
-	if err := syscall.Kill(-p.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+	if err := killProcess(p); err != nil {
 		p.t.Fatalf("kill: %v", err)
 	}
 	return p.waitExit(10 * time.Second)

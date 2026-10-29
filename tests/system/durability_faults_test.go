@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -236,6 +238,59 @@ func TestDLQWriteFaultKeepsEntriesRetried(t *testing.T) {
 // it forwards even when the traced process stops cleanly.
 func stopTolerant(p *proc) {
 	p.t.Helper()
-	_ = syscall.Kill(-p.cmd.Process.Pid, syscall.SIGTERM)
+	_ = signalProcess(p, syscall.SIGTERM)
 	p.waitExit(15 * time.Second)
+}
+
+// TestCheckpointWriteFailsOnFullFilesystem uses a real, small tmpfs inside
+// a user+mount namespace. Filling it makes every journal fsync fail with
+// ENOSPC. The process must stay up, keep delivering to the destination, and
+// report the failure instead of exiting or dropping records.
+func TestCheckpointWriteFailsOnFullFilesystem(t *testing.T) {
+	if _, err := exec.LookPath("unshare"); err != nil {
+		t.Skip("unshare is not installed")
+	}
+	if err := exec.Command("unshare", "-Ur", "-m", "true").Run(); err != nil {
+		t.Skipf("user mount namespaces are not available: %v", err)
+	}
+	const total = 2000
+	dir := t.TempDir()
+	mountPoint := filepath.Join(dir, "state")
+	if err := os.MkdirAll(mountPoint, 0o755); err != nil {
+		t.Fatalf("mkdir mount point: %v", err)
+	}
+	input := filepath.Join(dir, "audit.log")
+	output := filepath.Join(dir, "out.jsonl")
+	g := newOracleGenerator()
+	g.appendFile(t, input, total)
+
+	c := newTestConfig(t)
+	c.Global["checkpoints_dir"] = filepath.Join(mountPoint, "checkpoints")
+	p := oracleFilePipeline("enospc", input, output, 10)
+	p["runtime"].(map[string]any)["poll_interval"] = "5ms"
+	c.add(p)
+	cfg := c.write(t)
+
+	script := fmt.Sprintf("mount -t tmpfs -o size=64k none %q && dd if=/dev/zero of=%q bs=1024 count=56 2>/dev/null; exec \"$0\" \"$@\"",
+		mountPoint, filepath.Join(mountPoint, "fill"))
+	prefix := []string{"unshare", "-Ur", "-m", "sh", "-c", script}
+	proc := startProcCommand(t, prefix, []string{loghubBinary, "--config", cfg})
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("loghub log:\n%s", proc.log())
+		}
+	})
+
+	waitFor(t, 20*time.Second, "checkpoint ENOSPC logged", func() bool {
+		return strings.Contains(proc.log(), "no space left on device") ||
+			strings.Contains(proc.log(), "disk buffer size limit")
+	})
+	if _, exited, _ := proc.exitedWithin(100 * time.Millisecond); exited {
+		t.Fatal("process exited on ENOSPC instead of keeping the durable cursor and retrying")
+	}
+	// The destination is unaffected; records must still be delivered.
+	waitFor(t, 20*time.Second, "records delivered despite ENOSPC", func() bool {
+		return len(readLogEntriesTolerant(t, output)) >= 1
+	})
+	stopTolerant(proc)
 }

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package system_test
 
 import (
@@ -136,8 +138,12 @@ func TestRandomSIGKILLLoopKeepsEveryRecord(t *testing.T) {
 	rng := rand.New(rand.NewPCG(uint64(seed), uint64(seed>>1)))
 	t.Logf("crash loop: %d iterations, seed %d", iterations, seed)
 
+	only := os.Getenv("LOGHUB_CRASH_VARIANT")
 	for _, v := range crashVariants() {
 		v := v
+		if only != "" && only != v.name {
+			continue
+		}
 		t.Run(v.name, func(t *testing.T) {
 			if testing.Short() && (v.name == "two-pipelines" || v.name == "failing-destination-backlog") {
 				t.Skip("covered by the full qualification run")
@@ -216,6 +222,9 @@ func runCrashVariant(t *testing.T, v crashVariant, iterations int, rng *rand.Ran
 	cfg := c.write(t)
 
 	for iteration := 0; iteration < iterations; iteration++ {
+		if iteration%1000 == 0 && iteration > 0 {
+			t.Logf("crash iteration %d/%d", iteration, iterations)
+		}
 		for _, pf := range pipelines {
 			pf.gen.appendFile(t, pf.input, 8+rng.IntN(20))
 		}
@@ -258,7 +267,14 @@ func runCrashVariant(t *testing.T, v crashVariant, iterations int, rng *rand.Ran
 	// entries, so this bound is deliberately generous while still
 	// catching an unbounded replay loop.
 	pageEntries := 25
-	allowedExtra := iterations * (2*pageEntries + v.destinations)
+	// With a non-zero checkpoint interval, every crash may replay what was
+	// acknowledged since the last durable save. That is the documented
+	// trade-off of a longer interval, not an unbounded replay.
+	pagesPerInterval := 1
+	if v.checkpoint != "" {
+		pagesPerInterval = 16
+	}
+	allowedExtra := iterations * (2*pageEntries*pagesPerInterval + v.destinations)
 
 	for i, pf := range pipelines {
 		var observed []observedRecord
