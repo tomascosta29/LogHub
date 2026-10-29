@@ -78,17 +78,12 @@ func TestCheckpointWriteFaultKeepsCursorAndIsObservable(t *testing.T) {
 					t.Errorf("checkpoints_saved_total = %v while every checkpoint fsync failed", got)
 				}
 			}
-			code, h, err := fetchHealth(proc.addr)
+			_, h, err := fetchHealth(proc.addr)
 			if err != nil {
 				t.Fatalf("health: %v", err)
 			}
-			if code == http.StatusOK {
-				status := ""
-				if len(h.Pipelines) > 0 {
-					status = h.Pipelines[0].Status
-				}
-				t.Errorf("checkpoint fsync fails with %s but /health reports 200 (status %q): operators watching health cannot see a non-durable pipeline",
-					inject, status)
+			if len(h.Pipelines) != 1 || h.Pipelines[0].Status != "degraded" || !strings.Contains(h.Pipelines[0].ErrorMsg, "checkpoint") {
+				t.Errorf("checkpoint fsync fails with %s but health = %+v, want the pipeline degraded with the checkpoint error", inject, h.Pipelines)
 			}
 			stopTolerant(proc)
 

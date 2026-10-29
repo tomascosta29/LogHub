@@ -17,9 +17,9 @@ import (
 	"loghub/internal/core"
 )
 
-// envInt reads a positive integer setting, falling back to def. Gated
-// These settings let the same test run cheaply in CI and with large
-// parameters on a qualification run.
+// envInt reads a positive integer setting, falling back to def. These
+// settings let the same test run cheaply in CI and with large parameters
+// in a long run.
 func envInt(name string, def int) int {
 	raw := os.Getenv(name)
 	if raw == "" {
@@ -146,7 +146,7 @@ func TestRandomSIGKILLLoopKeepsEveryRecord(t *testing.T) {
 		}
 		t.Run(v.name, func(t *testing.T) {
 			if testing.Short() && (v.name == "two-pipelines" || v.name == "failing-destination-backlog") {
-				t.Skip("covered by the full qualification run")
+				t.Skip("skipped in -short mode")
 			}
 			runCrashVariant(t, v, iterations, rng)
 		})

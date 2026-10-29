@@ -119,7 +119,7 @@ func TestOracleTracksHTTPDestination(t *testing.T) {
 	waitFor(t, 20*time.Second, "HTTP destination to accept every record", func() bool {
 		return s.acceptedEntries() >= 200
 	})
-	entries := s.deliveredLogEntries(t)
+	entries := s.acceptedLogEntries(t)
 	verifyOracle(t, g, oracleCheck{
 		Destinations: []string{"http"},
 		Observed:     observedFromLogEntries("http", entries),

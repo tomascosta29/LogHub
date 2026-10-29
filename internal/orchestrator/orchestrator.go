@@ -25,6 +25,10 @@ type Orchestrator struct {
 	shutdownOnce sync.Once
 	reloadCh     chan struct{}
 	running      bool
+	// shutdownErr is the outcome of the first shutdown, reported by
+	// ShutdownErr after Wait returns. Guarded by mu.
+	shutdownErr  error
+	shutdownDone bool
 	reload       ReloadFunc
 	startedAt    time.Time
 	mu           sync.Mutex
@@ -73,6 +77,15 @@ func (o *Orchestrator) snapshot() []*pipeline.Pipeline {
 // stopped, the rest are closed, and the orchestrator is left with no
 // pipelines; the caller restores the previous configuration.
 func (o *Orchestrator) ReplacePipelines(pipelines []*pipeline.Pipeline) error {
+	return o.ReplacePipelinesWith(func() ([]*pipeline.Pipeline, error) { return pipelines, nil })
+}
+
+// ReplacePipelinesWith stops the running pipelines, then calls build and
+// starts what it returns. Building after the stop matters: pipelines open
+// their disk buffer and DLQ journals when they are built, and a new
+// pipeline that loads a backlog the old one is still draining would send
+// that backlog twice. If build fails, no pipelines are running.
+func (o *Orchestrator) ReplacePipelinesWith(build func() ([]*pipeline.Pipeline, error)) error {
 	o.mu.Lock()
 	if !o.running {
 		o.mu.Unlock()
@@ -90,6 +103,14 @@ func (o *Orchestrator) ReplacePipelines(pipelines []*pipeline.Pipeline) error {
 		}(p)
 	}
 	wg.Wait()
+
+	pipelines, err := build()
+	if err != nil {
+		o.mu.Lock()
+		o.pipelines = nil
+		o.mu.Unlock()
+		return err
+	}
 
 	o.mu.Lock()
 	o.pipelines = pipelines
@@ -270,6 +291,15 @@ func (o *Orchestrator) Wait() {
 	o.wg.Wait()
 }
 
+// ShutdownErr returns the error from the shutdown that ended the run, such
+// as pipelines that missed the deadline with sends in flight. It is nil
+// for a clean stop and is meaningful once Wait has returned.
+func (o *Orchestrator) ShutdownErr() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.shutdownErr
+}
+
 // shutdownCloseAllowance is the time Shutdown allows, beyond the longest
 // pipeline MaxStopDuration, for closing sources and destinations.
 const shutdownCloseAllowance = 5 * time.Second
@@ -332,6 +362,10 @@ func (o *Orchestrator) ShutdownContext(ctx context.Context) error {
 
 	o.mu.Lock()
 	o.running = false
+	if !o.shutdownDone {
+		o.shutdownDone = true
+		o.shutdownErr = err
+	}
 	o.mu.Unlock()
 
 	// Close shutdownCh here so direct Shutdown() callers (e.g. tests)

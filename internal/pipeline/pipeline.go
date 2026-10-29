@@ -204,6 +204,7 @@ func (p *Pipeline) Health() PipelineHealth {
 		LastSend:    p.health.LastSend,
 		LastError:   p.health.LastError,
 		ErrorMsg:    p.health.ErrorMsg,
+		StartedAt:   p.health.StartedAt,
 		Status:      p.status,
 	}
 }
@@ -303,13 +304,27 @@ func NewPipeline(
 		// Publish the initial state so dashboards see a closed breaker
 		// (0) before it has ever tripped. The hook only fires on
 		// transitions, so without this the series would be absent.
-		metrics.CircuitBreakerState.WithLabelValues(id, destTypeOf(destinations[i].Destination)).Set(float64(destinations[i].Breaker.State()))
+		destType := destTypeOf(destinations[i].Destination)
+		metrics.CircuitBreakerState.WithLabelValues(id, destType).Set(float64(destinations[i].Breaker.State()))
+		// Counters are published at 0 for the same reason: rate() and
+		// increase() cannot see the first event of a series that does
+		// not exist yet.
+		metrics.EntriesSent.WithLabelValues(id, destType).Add(0)
+		metrics.EntriesFailed.WithLabelValues(id, destType).Add(0)
+		metrics.Retries.WithLabelValues(id, destType).Add(0)
+		metrics.CircuitBreakerTrippedTotal.WithLabelValues(id, destType).Add(0)
 	}
-	// Publish the collect-error counter at 0 for the same reason: rate()
-	// and increase() cannot see the first error of a series that does not
-	// exist yet.
 	if source != nil {
+		metrics.EntriesCollected.WithLabelValues(id, source.Name()).Add(0)
 		metrics.CollectErrors.WithLabelValues(id, source.Name()).Add(0)
+	}
+	metrics.BatchesCollected.WithLabelValues(id).Add(0)
+	metrics.BatchesSent.WithLabelValues(id).Add(0)
+	metrics.CheckpointsSaved.WithLabelValues(id).Add(0)
+	metrics.CheckpointErrors.WithLabelValues(id).Add(0)
+	metrics.DLQEntries.WithLabelValues(id).Add(0)
+	for _, reason := range []string{dropProcessorRejected, dropDestinationRejected} {
+		metrics.EntriesDropped.WithLabelValues(id, reason).Add(0)
 	}
 
 	return &Pipeline{

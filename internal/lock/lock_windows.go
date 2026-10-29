@@ -21,6 +21,12 @@ var (
 
 var errAlreadyLocked = errors.New("lock: already held")
 
+const openNoFollow = 0
+
+// lockDir is a no-op: Windows does not lock directories, and an open file
+// cannot be deleted there anyway.
+func lockDir(string) (*os.File, error) { return nil, nil }
+
 func flock(f *os.File, nonBlocking bool) error {
 	windowsMu.Lock()
 	defer windowsMu.Unlock()

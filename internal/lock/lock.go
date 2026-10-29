@@ -20,6 +20,12 @@ import (
 type FileLock struct {
 	path string
 	f    *os.File
+	// dir holds a lock on the lock file's directory where the platform
+	// supports it. The file lock alone follows the inode, so deleting the
+	// lock file would let a second process lock a new file at the same
+	// path; the directory cannot be swapped out from under a running
+	// process the same way.
+	dir  *os.File
 	once sync.Once
 }
 
@@ -32,10 +38,10 @@ func Acquire(path string) (*FileLock, error) {
 	if path == "" {
 		return nil, fmt.Errorf("lock: path is required")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("lock: failed to create directory: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|openNoFollow, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("lock: failed to open %q: %w", path, err)
 	}
@@ -46,7 +52,13 @@ func Acquire(path string) (*FileLock, error) {
 		f.Close()
 		return nil, fmt.Errorf("lock: %q is held by another process: %w", path, err)
 	}
-	return &FileLock{path: path, f: f}, nil
+	dir, err := lockDir(filepath.Dir(path))
+	if err != nil {
+		_ = unflock(f)
+		f.Close()
+		return nil, fmt.Errorf("lock: directory of %q is held by another process: %w", path, err)
+	}
+	return &FileLock{path: path, f: f, dir: dir}, nil
 }
 
 // TryAcquire is the same as Acquire but does not create the lock file if
@@ -67,6 +79,11 @@ func (l *FileLock) Release() error {
 	}
 	var err error
 	l.once.Do(func() {
+		if l.dir != nil {
+			_ = unflock(l.dir)
+			l.dir.Close()
+			l.dir = nil
+		}
 		if l.f != nil {
 			_ = unflock(l.f)
 			err = l.f.Close()

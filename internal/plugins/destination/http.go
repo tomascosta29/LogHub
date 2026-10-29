@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -144,7 +145,7 @@ func (h *HTTP) SendRaw(ctx context.Context, body []byte, n int, extraHeaders map
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", redactURLError(err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-LogSource", h.sourceName)
@@ -176,13 +177,40 @@ func noRedirects(*http.Request, []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
+// redactURLError removes credentials from the URL that net/http puts in
+// its errors. Some ingestion endpoints take a token in the query string,
+// and request errors end up in logs and in /health.
+func redactURLError(err error) error {
+	var ue *neturl.Error
+	if errors.As(err, &ue) {
+		ue.URL = redactURL(ue.URL)
+	}
+	return err
+}
+
+// redactURL hides the userinfo password and every query value of raw.
+func redactURL(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return "<unparseable url>"
+	}
+	if u.RawQuery != "" {
+		q := u.Query()
+		for k := range q {
+			q[k] = []string{"xxxxx"}
+		}
+		u.RawQuery = q.Encode()
+	}
+	return u.Redacted()
+}
+
 func (h *HTTP) do(ctx context.Context, req *http.Request, n int) ([]core.EntryStatus, error) {
 	resp, err := h.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, ErrTimeout
 		}
-		return nil, fmt.Errorf("request failed: %w", err)
+		return nil, fmt.Errorf("request failed: %w", redactURLError(err))
 	}
 	defer resp.Body.Close()
 

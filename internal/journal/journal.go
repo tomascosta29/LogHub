@@ -33,6 +33,97 @@ type barrierMarker struct {
 	Barrier bool `json:"barrier"`
 }
 
+// ErrCorrupt is returned when a journal has unreadable records inside its
+// committed part. Such a file was damaged after it was written, so its
+// state cannot be trusted; treating it as empty would silently restart a
+// cursor from the beginning or discard a backlog.
+var ErrCorrupt = errors.New("journal is corrupt")
+
+// lineKind classifies one journal line.
+type lineKind int
+
+const (
+	lineEmpty lineKind = iota
+	lineEntry
+	lineBarrier
+	lineInvalid
+)
+
+func classify(line []byte) (lineKind, Entry) {
+	if len(line) == 0 {
+		return lineEmpty, Entry{}
+	}
+	var e Entry
+	if err := json.Unmarshal(line, &e); err == nil && e.ID > 0 {
+		return lineEntry, e
+	}
+	var b barrierMarker
+	if err := json.Unmarshal(line, &b); err == nil && b.Barrier {
+		return lineBarrier, Entry{}
+	}
+	return lineInvalid, Entry{}
+}
+
+// isZeroFill reports whether line holds only NUL bytes, which is what a
+// power loss can leave where an unsynced write had extended the file.
+func isZeroFill(line []byte) bool {
+	for _, c := range line {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// inspect validates the journal read from r. It returns the highest entry
+// ID and the byte offset just past the last barrier; everything after that
+// offset is an uncommitted tail. An unreadable line before the last
+// barrier is corruption. In the tail only what a crash can leave is
+// accepted: a final line cut off before its newline, or zero fill.
+func inspect(r io.Reader) (maxID, committedEnd int64, err error) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	var offset int64
+	var lineNo int
+	firstBadLine := 0
+	for {
+		raw, readErr := br.ReadBytes('\n')
+		if len(raw) > 0 {
+			lineNo++
+			offset += int64(len(raw))
+			terminated := raw[len(raw)-1] == '\n'
+			line := raw
+			if terminated {
+				line = raw[:len(raw)-1]
+			}
+			switch kind, e := classify(line); kind {
+			case lineEntry:
+				if firstBadLine > 0 {
+					return 0, 0, fmt.Errorf("unreadable record at line %d: %w", firstBadLine, ErrCorrupt)
+				}
+				maxID = max(maxID, e.ID)
+			case lineBarrier:
+				if firstBadLine > 0 {
+					return 0, 0, fmt.Errorf("unreadable record at line %d: %w", firstBadLine, ErrCorrupt)
+				}
+				committedEnd = offset
+			case lineInvalid:
+				if terminated && !isZeroFill(line) {
+					return 0, 0, fmt.Errorf("unreadable record at line %d: %w", lineNo, ErrCorrupt)
+				}
+				if firstBadLine == 0 {
+					firstBadLine = lineNo
+				}
+			}
+		}
+		if readErr == io.EOF {
+			return maxID, committedEnd, nil
+		}
+		if readErr != nil {
+			return 0, 0, readErr
+		}
+	}
+}
+
 // Journal is a single-writer append-only log with explicit barriers. It is
 // safe for concurrent callers of Append and Barrier, but Recover holds the
 // write lock and should not be called concurrently with writes from the same
@@ -54,10 +145,10 @@ func Open(path string) (*Journal, error) {
 		return nil, fmt.Errorf("journal: path is required")
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("journal: failed to create directory: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|openNoFollow, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("journal: failed to open: %w", err)
 	}
@@ -86,29 +177,27 @@ func (j *Journal) recoverNextID() error {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		// Try to decode as a regular entry with an ID.
-		var e Entry
-		if err := json.Unmarshal(line, &e); err == nil && e.ID > 0 {
-			if e.ID > j.next {
-				j.next = e.ID
-			}
-			continue
-		}
-		// Otherwise try a barrier marker; ignore it.
-		var b barrierMarker
-		if err := json.Unmarshal(line, &b); err == nil && b.Barrier {
-			continue
-		}
-		// Skip silently on parse error (partial trailing line after a crash).
+	maxID, committedEnd, err := inspect(f)
+	if err != nil {
+		return fmt.Errorf("%s: %w", j.path, err)
 	}
-	return scanner.Err()
+	j.next = maxID
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() > committedEnd {
+		// Drop the uncommitted tail a crash left behind, so the next
+		// append starts on a fresh line and is not merged with a torn
+		// record or committed together with stale ones.
+		if err := j.f.Truncate(committedEnd); err != nil {
+			return fmt.Errorf("journal: trim uncommitted tail: %w", err)
+		}
+		if err := j.f.Sync(); err != nil {
+			return fmt.Errorf("journal: sync after trim: %w", err)
+		}
+	}
+	return nil
 }
 
 // Append encodes and writes a single entry. The entry is not durable until
@@ -149,30 +238,14 @@ func (j *Journal) Barrier() error {
 // on-disk format is identical to a separate Append and Barrier call; this
 // just folds the two writes and the fsync into one operation.
 //
-// Returns the assigned entry ID. The ID is released only when the
-// entry's encode fails. If the barrier encode or the fsync fails, the
-// entry is already on disk with its ID, so the ID stays consumed; the
-// orphaned entry has no closing barrier and is ignored by Recover.
+// Returns the assigned entry ID. On failure the write is undone (see
+// undoWrite) and the ID is released.
 func (j *Journal) AppendBarrier(data []byte) (int64, error) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.next++
-	id := j.next
-	e := Entry{ID: id, Data: data}
-	if err := j.enc.Encode(&e); err != nil {
-		j.next--
-		return 0, fmt.Errorf("journal: append failed: %w", err)
+	ids, err := j.CommitTransaction(data)
+	if err != nil {
+		return 0, err
 	}
-	if err := j.enc.Encode(&barrierMarker{Barrier: true}); err != nil {
-		return id, fmt.Errorf("journal: barrier encode failed: %w", err)
-	}
-	if err := j.f.Sync(); err != nil {
-		return id, fmt.Errorf("journal: sync failed: %w", err)
-	}
-	if err := syncDir(j.dir); err != nil {
-		return id, fmt.Errorf("journal: dir sync failed: %w", err)
-	}
-	return id, nil
+	return ids[0], nil
 }
 
 // CommitTransaction appends N entries to the journal and barrier-fsyncs
@@ -185,10 +258,9 @@ func (j *Journal) AppendBarrier(data []byte) (int64, error) {
 // (e.g. "drain disk buffer marker" + "advance cursor") write them in
 // one CommitTransaction call.
 //
-// If an entry's encode fails, only that entry's ID is released: the
-// entries encoded before it are already on disk and keep their IDs, so
-// later Appends cannot reuse them. Orphaned entries without a closing
-// barrier are ignored by Recover.
+// If any write or the fsync fails, the transaction is undone (see
+// undoWrite) and its IDs are released, so a caller that retries does not
+// leave a second copy behind.
 //
 // It returns the IDs assigned to the payloads, in order.
 func (j *Journal) CommitTransaction(payloads ...[]byte) ([]int64, error) {
@@ -198,26 +270,46 @@ func (j *Journal) CommitTransaction(payloads ...[]byte) ([]int64, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
+	start, err := j.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, fmt.Errorf("journal: transaction start: %w", err)
+	}
+	firstID := j.next
+	fail := func(err error) ([]int64, error) {
+		return nil, j.undoWrite(start, firstID, err)
+	}
 	ids := make([]int64, 0, len(payloads))
 	for _, data := range payloads {
 		j.next++
 		e := Entry{ID: j.next, Data: data}
 		if err := j.enc.Encode(&e); err != nil {
-			j.next--
-			return nil, fmt.Errorf("journal: transaction append failed: %w", err)
+			return fail(fmt.Errorf("journal: transaction append failed: %w", err))
 		}
 		ids = append(ids, j.next)
 	}
 	if err := j.enc.Encode(&barrierMarker{Barrier: true}); err != nil {
-		return nil, fmt.Errorf("journal: transaction barrier encode failed: %w", err)
+		return fail(fmt.Errorf("journal: transaction barrier encode failed: %w", err))
 	}
 	if err := j.f.Sync(); err != nil {
-		return nil, fmt.Errorf("journal: transaction sync failed: %w", err)
+		return fail(fmt.Errorf("journal: transaction sync failed: %w", err))
 	}
 	if err := syncDir(j.dir); err != nil {
-		return nil, fmt.Errorf("journal: transaction dir sync failed: %w", err)
+		return fail(fmt.Errorf("journal: transaction dir sync failed: %w", err))
 	}
 	return ids, nil
+}
+
+// undoWrite cuts the file back to size and restores the ID counter after a
+// failed transaction. Without it, a commit whose fsync failed stays in the
+// page cache with its barrier and becomes durable on a later fsync, next
+// to the copy the caller writes when it retries. The caller must hold
+// j.mu.
+func (j *Journal) undoWrite(size, nextID int64, cause error) error {
+	j.next = nextID
+	if err := j.f.Truncate(size); err != nil {
+		return errors.Join(cause, fmt.Errorf("journal: undo failed write: %w", err))
+	}
+	return cause
 }
 
 // ReadCommitted invokes callback once per committed entry, in order,
@@ -268,18 +360,23 @@ func scanCommitted(r io.Reader, callback func(id int64, data []byte) error) erro
 	var pending []Entry
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	lineNo, badLine := 0, 0
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+		lineNo++
+		kind, e := classify(scanner.Bytes())
+		if kind == lineInvalid {
+			if badLine == 0 {
+				badLine = lineNo
+			}
 			continue
 		}
-		var e Entry
-		if err := json.Unmarshal(line, &e); err == nil && e.ID > 0 {
+		if kind != lineEmpty && badLine > 0 {
+			return fmt.Errorf("unreadable record at line %d: %w", badLine, ErrCorrupt)
+		}
+		switch kind {
+		case lineEntry:
 			pending = append(pending, e)
-			continue
-		}
-		var b barrierMarker
-		if err := json.Unmarshal(line, &b); err == nil && b.Barrier {
+		case lineBarrier:
 			for _, pe := range pending {
 				if err := callback(pe.ID, pe.Data); err != nil {
 					return err
@@ -324,11 +421,11 @@ func (j *Journal) rewriteLocked(entries [][]byte, barrierEach bool) error {
 		}
 	}
 
-	if err := os.MkdirAll(j.dir, 0755); err != nil {
+	if err := os.MkdirAll(j.dir, 0o700); err != nil {
 		return j.reopenAfterFailure(fmt.Errorf("journal: mkdir before rewrite: %w", err))
 	}
 	tmpPath := j.path + ".rewrite.tmp"
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|openNoFollow, 0o600)
 	if err != nil {
 		return j.reopenAfterFailure(fmt.Errorf("journal: open rewrite temp: %w", err))
 	}
@@ -396,7 +493,7 @@ func (j *Journal) reopenLocked() error {
 		j.f.Close()
 		j.f = nil
 	}
-	f, err := os.OpenFile(j.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(j.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|openNoFollow, 0o600)
 	if err != nil {
 		return err
 	}
@@ -438,18 +535,23 @@ func (j *Journal) recoverLocked() ([]Entry, error) {
 	barrierEntryIdx := []int{}
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	lineNo, badLine := 0, 0
 	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+		lineNo++
+		kind, e := classify(scanner.Bytes())
+		if kind == lineInvalid {
+			if badLine == 0 {
+				badLine = lineNo
+			}
 			continue
 		}
-		var e Entry
-		if err := json.Unmarshal(line, &e); err == nil && e.ID > 0 {
+		if kind != lineEmpty && badLine > 0 {
+			return nil, fmt.Errorf("journal: %s: unreadable record at line %d: %w", j.path, badLine, ErrCorrupt)
+		}
+		switch kind {
+		case lineEntry:
 			allEntries = append(allEntries, e)
-			continue
-		}
-		var b barrierMarker
-		if err := json.Unmarshal(line, &b); err == nil && b.Barrier {
+		case lineBarrier:
 			barrierEntryIdx = append(barrierEntryIdx, len(allEntries))
 		}
 	}

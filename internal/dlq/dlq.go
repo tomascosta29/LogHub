@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -132,8 +133,10 @@ func (d *DeadLetterQueue) Rotate() error {
 		return fmt.Errorf("dlq: close before rotate: %w", err)
 	}
 
-	now := time.Now().UTC().Format("20060102T150405")
-	archivePath := d.journal.Path() + "." + now + ".archive"
+	archivePath, err := freeArchivePath(d.journal.Path(), time.Now())
+	if err != nil {
+		return fmt.Errorf("dlq: choose archive name: %w", err)
+	}
 	if err := os.Rename(d.journal.Path(), archivePath); err != nil {
 		renameErr := fmt.Errorf("dlq: rotate rename failed: %w", err)
 		// Keep writing to the current journal rather than leaving the
@@ -153,6 +156,26 @@ func (d *DeadLetterQueue) Rotate() error {
 	d.journal = j
 	d.count = 0
 	return nil
+}
+
+// freeArchivePath returns an archive name for journalPath that does not
+// exist yet. os.Rename replaces an existing target, so two rotations that
+// produced the same name would silently discard the older archive. Names
+// sort chronologically.
+func freeArchivePath(journalPath string, now time.Time) (string, error) {
+	base := journalPath + "." + now.UTC().Format("20060102T150405.000000000")
+	for n := 0; n < 1000; n++ {
+		path := base + ".archive"
+		if n > 0 {
+			path = fmt.Sprintf("%s-%03d.archive", base, n)
+		}
+		if _, err := os.Lstat(path); errors.Is(err, fs.ErrNotExist) {
+			return path, nil
+		} else if err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("no free archive name for %s", base)
 }
 
 // recoverCount counts the committed records in the journal. Each record

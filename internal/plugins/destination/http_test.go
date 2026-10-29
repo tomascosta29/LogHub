@@ -302,3 +302,13 @@ func TestHTTPErrorsOmitResponseBody(t *testing.T) {
 		}
 	}
 }
+
+func TestRedactURLHidesQueryValuesAndPassword(t *testing.T) {
+	got := redactURL("https://user:pass@example.com/ingest?token=secret&x=1")
+	if strings.Contains(got, "secret") || strings.Contains(got, "pass@") {
+		t.Fatalf("redactURL leaked a credential: %s", got)
+	}
+	if !strings.Contains(got, "example.com/ingest") {
+		t.Fatalf("redactURL lost the host and path: %s", got)
+	}
+}

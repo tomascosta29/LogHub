@@ -13,6 +13,12 @@ import (
 	"loghub/internal/lock"
 )
 
+// ownerPrefix marks the record, written in the same transaction as each
+// cursor, that names the pipeline the journal belongs to. The cursor stays
+// the last record of the transaction, so older builds that read only the
+// last record still find it.
+const ownerPrefix = "loghub.pipeline="
+
 // compactEvery is how many cursor saves a pipeline's journal accumulates
 // before it is compacted down to the latest cursor.
 const compactEvery = 1000
@@ -54,7 +60,7 @@ type pipelineState struct {
 // <dirPath>/.lock; if another process holds the lock, this function returns
 // an error and the caller should fail-fast.
 func NewFileCheckpointer(dirPath string) (*FileCheckpointer, error) {
-	if err := os.MkdirAll(dirPath, 0755); err != nil {
+	if err := os.MkdirAll(dirPath, 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create checkpoints directory: %w", err)
 	}
 	l, err := lock.Acquire(filepath.Join(dirPath, ".lock"))
@@ -113,11 +119,8 @@ func (fc *FileCheckpointer) Set(pipelineID, cursor string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := s.journal.Append([]byte(cursor)); err != nil {
-		return fmt.Errorf("checkpointer: append failed for %s: %w", pipelineID, err)
-	}
-	if err := s.journal.Barrier(); err != nil {
-		return fmt.Errorf("checkpointer: barrier failed for %s: %w", pipelineID, err)
+	if _, err := s.journal.CommitTransaction([]byte(ownerPrefix+pipelineID), []byte(cursor)); err != nil {
+		return fmt.Errorf("checkpointer: commit failed for %s: %w", pipelineID, err)
 	}
 	s.cached = cursor
 	s.sinceCompact++
@@ -225,6 +228,11 @@ func (fc *FileCheckpointer) openPipelineLocked(pipelineID string, s *pipelineSta
 		return nil, fmt.Errorf("checkpointer: recover journal for %s: %w", pipelineID, err)
 	}
 	if len(entries) > 0 {
+		if owner, ok := strings.CutPrefix(string(entries[0].Data), ownerPrefix); ok && len(entries) > 1 && owner != pipelineID {
+			j.Close()
+			s.journal = nil
+			return nil, fmt.Errorf("checkpointer: %s holds the cursor of pipeline %q, not %q; it was copied or renamed. Move it aside to start %q without a cursor", journalPath, owner, pipelineID, pipelineID)
+		}
 		s.cached = string(entries[len(entries)-1].Data)
 	} else {
 		// Empty journal: try migration from legacy .cursor file.

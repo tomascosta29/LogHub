@@ -82,3 +82,26 @@ func TestPerEntryRejectionDegradesPipeline(t *testing.T) {
 		}
 	}
 }
+
+func TestFailedCheckpointDegradesPipelineAndIsCounted(t *testing.T) {
+	cp := &mockCheckpointer{setErr: errors.New("fsync: input/output error")}
+	p := NewPipeline("checkpoint-fails", &mockSource{}, nil, nil, cp, &PipelineSettings{
+		PollInterval:               time.Second,
+		StalledThresholdMultiplier: 5,
+	}, nil, nil)
+	p.SetStatus(PipelineStatusRunning)
+	p.mu.Lock()
+	p.health.StartedAt = time.Now()
+	p.mu.Unlock()
+	before := testutil.ToFloat64(metrics.CheckpointErrors.WithLabelValues("checkpoint-fails"))
+
+	p.commitCursor(&checkpointState{}, "cursor-1")
+
+	if got := testutil.ToFloat64(metrics.CheckpointErrors.WithLabelValues("checkpoint-fails")) - before; got != 1 {
+		t.Fatalf("checkpoint_errors_total increased by %v, want 1", got)
+	}
+	h := p.Health()
+	if p.Status() != PipelineStatusDegraded || !strings.Contains(h.ErrorMsg, "checkpoint not saved") {
+		t.Fatalf("status = %s, error = %q; want degraded with the checkpoint error", p.Status(), h.ErrorMsg)
+	}
+}

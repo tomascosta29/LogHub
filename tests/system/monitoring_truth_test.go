@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -88,18 +89,16 @@ func TestHealthDoesNotReportHealthyWhileDropping(t *testing.T) {
 	waitForMetric(t, proc.addr, "loghub_entries_dropped_total",
 		map[string]string{"pipeline_id": "drop-health", "reason": "destination_rejected"},
 		15*time.Second, "entries dropped", func(v float64) bool { return v >= total })
-	code, h, err := fetchHealth(proc.addr)
+	_, h, err := fetchHealth(proc.addr)
 	proc.stop()
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	if code == http.StatusOK {
-		status := ""
-		if len(h.Pipelines) > 0 {
-			status = h.Pipelines[0].Status
-		}
-		t.Fatalf("/health returns 200 (pipeline %q) in the same instant that %d records were dropped without a DLQ; "+
-			"only the dropped counter alerts, and an operator watching liveness would see a healthy process", status, total)
+	// /health stays 200 so a liveness probe does not restart LogHub over
+	// a rejection a restart cannot fix, but the drop must be visible in
+	// the pipeline's status and error.
+	if len(h.Pipelines) != 1 || h.Pipelines[0].Status != "degraded" || h.Pipelines[0].ErrorMsg == "" {
+		t.Fatalf("health after %d records were dropped without a DLQ = %+v, want the pipeline degraded with the rejection as its error", total, h.Pipelines)
 	}
 }
 
@@ -143,17 +142,15 @@ func TestCheckpointFailureIsObservable(t *testing.T) {
 	if got := counterValue(fams, "loghub_checkpoints_saved_total", map[string]string{"pipeline_id": "eio-checkpoint"}); got != 0 {
 		t.Errorf("checkpoints_saved_total = %v despite every fsync failing, want 0", got)
 	}
-	code, h, err := fetchHealth(proc.addr)
+	if got := counterValue(fams, "loghub_checkpoint_errors_total", map[string]string{"pipeline_id": "eio-checkpoint"}); got == 0 {
+		t.Errorf("checkpoint_errors_total = 0 while every checkpoint fsync failed")
+	}
+	_, h, err := fetchHealth(proc.addr)
 	if err != nil {
 		t.Fatalf("health: %v", err)
 	}
-	if code == http.StatusOK {
-		status := ""
-		if len(h.Pipelines) > 0 {
-			status = h.Pipelines[0].Status
-		}
-		t.Fatalf("checkpoint writes are failing but /health reports 200 (status %q); the only signal is a log line and a counter that stopped increasing",
-			status)
+	if len(h.Pipelines) != 1 || h.Pipelines[0].Status != "degraded" || !strings.Contains(h.Pipelines[0].ErrorMsg, "checkpoint") {
+		t.Fatalf("health while checkpoint writes fail = %+v, want the pipeline degraded with the checkpoint error", h.Pipelines)
 	}
 	proc.stop()
 }

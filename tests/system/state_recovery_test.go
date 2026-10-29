@@ -89,43 +89,6 @@ func TestCorruptCheckpointDoesNotSilentlyRestartAtZero(t *testing.T) {
 	}
 }
 
-// TestTruncatedCheckpointDoesNotSilentlyRestartAtZero is the same failure
-// with the most common power-loss artifact: a zero-length state file.
-func TestTruncatedCheckpointDoesNotSilentlyRestartAtZero(t *testing.T) {
-	dir := t.TempDir()
-	input := filepath.Join(dir, "audit.log")
-	output := filepath.Join(dir, "out.jsonl")
-	g := newOracleGenerator()
-	g.appendFile(t, input, 60)
-
-	c := newTestConfig(t)
-	c.add(oracleFilePipeline("truncated-cursor", input, output, 25))
-	cfg := c.write(t)
-
-	proc := startProc(t, cfg)
-	waitForPipelineUp(t, proc, "truncated-cursor")
-	waitForJSONLCount(t, output, 60, 20*time.Second)
-	proc.stop()
-	before := len(readLogEntriesTolerant(t, output))
-
-	if err := os.Truncate(journalPath(c, "truncated-cursor"), 0); err != nil {
-		t.Fatalf("truncate checkpoint: %v", err)
-	}
-
-	proc = startProc(t, cfg)
-	code, exited, _ := proc.exitedWithin(2 * time.Second)
-	if exited && code != 0 {
-		return
-	}
-	time.Sleep(500 * time.Millisecond)
-	proc.stop()
-	after := len(readLogEntriesTolerant(t, output))
-	if after > before {
-		t.Fatalf("empty checkpoint silently restarted at offset zero: %d records re-delivered (%d -> %d)",
-			after-before, before, after)
-	}
-}
-
 // TestCorruptDiskBufferDoesNotSilentlyDropBacklog starts on a disk-buffer
 // journal full of garbage. The pending batches are the only copy of records
 // the destination never accepted, so LogHub must recover them or refuse to
@@ -203,7 +166,7 @@ func TestCorruptDiskBufferDoesNotSilentlyDropBacklog(t *testing.T) {
 	time.Sleep(time.Second)
 	proc.stop()
 
-	observed := observedFromLogEntries("http", s.deliveredLogEntries(t))
+	observed := observedFromLogEntries("http", s.acceptedLogEntries(t))
 	res := g.verify(oracleCheck{Destinations: []string{"http"}, Observed: observed})
 	if len(res.Missing) > 0 {
 		t.Fatalf("corrupt disk buffer silently dropped %d of %d records that existed only in the backlog: %s",

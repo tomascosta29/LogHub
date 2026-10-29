@@ -59,8 +59,9 @@ func TestReloadWithPendingDiskBufferLosesNoRecords(t *testing.T) {
 		return s.acceptedEntries() >= total
 	})
 	proc.stop()
+	t.Log(proc.log())
 
-	observed := observedFromLogEntries("http", s.deliveredLogEntries(t))
+	observed := observedFromLogEntries("http", s.acceptedLogEntries(t))
 	verifyOracle(t, g, oracleCheck{
 		Destinations: []string{"http"},
 		Observed:     observed,
