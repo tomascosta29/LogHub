@@ -430,6 +430,7 @@ func waitFor(t *testing.T, timeout time.Duration, desc string, cond func() bool)
 type healthPipeline struct {
 	ID          string    `json:"ID"`
 	Status      string    `json:"Status"`
+	StartedAt   time.Time `json:"StartedAt"`
 	LastCollect time.Time `json:"LastCollect"`
 	LastSend    time.Time `json:"LastSend"`
 	LastError   time.Time `json:"LastError"`
