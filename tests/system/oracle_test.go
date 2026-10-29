@@ -136,17 +136,21 @@ func (r oracleRecord) fields() map[string]string {
 // database. The column names match what the pipeline source configuration
 // expects.
 func (g *oracleGenerator) createSQLiteTable(t *testing.T, db *sql.DB) {
+	g.createSQLiteTableOn(t, db, "oracle_events")
+}
+
+func (g *oracleGenerator) createSQLiteTableOn(t *testing.T, db *sql.DB, table string) {
 	t.Helper()
-	if _, err := db.Exec(`
-		CREATE TABLE oracle_events (
+	if _, err := db.Exec(fmt.Sprintf(`
+		CREATE TABLE %s (
 			id TEXT PRIMARY KEY,
 			seq INTEGER NOT NULL,
 			event_time TEXT NOT NULL,
 			generated_at TEXT NOT NULL,
 			checksum TEXT NOT NULL,
 			payload TEXT NOT NULL
-		)`); err != nil {
-		t.Fatalf("create oracle_events: %v", err)
+		)`, table)); err != nil {
+		t.Fatalf("create %s: %v", table, err)
 	}
 }
 
@@ -154,6 +158,10 @@ func (g *oracleGenerator) createSQLiteTable(t *testing.T, db *sql.DB) {
 // transaction. The rows become visible atomically, like a committed audit
 // batch.
 func (g *oracleGenerator) insertSQLite(t *testing.T, db *sql.DB, n int) []oracleRecord {
+	return g.insertSQLiteOn(t, db, "oracle_events", n)
+}
+
+func (g *oracleGenerator) insertSQLiteOn(t *testing.T, db *sql.DB, table string, n int) []oracleRecord {
 	t.Helper()
 	recs := g.generate(n)
 	if len(recs) == 0 {
@@ -163,7 +171,7 @@ func (g *oracleGenerator) insertSQLite(t *testing.T, db *sql.DB, n int) []oracle
 	if err != nil {
 		t.Fatalf("begin oracle insert: %v", err)
 	}
-	stmt, err := tx.Prepare(`INSERT INTO oracle_events (id, seq, event_time, generated_at, checksum, payload) VALUES (?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO %s (id, seq, event_time, generated_at, checksum, payload) VALUES (?, ?, ?, ?, ?, ?)`, table))
 	if err != nil {
 		tx.Rollback()
 		t.Fatalf("prepare oracle insert: %v", err)
@@ -644,7 +652,13 @@ func oracleFilePipeline(id, path, output string, fetchSize int) map[string]any {
 
 // oracleSQLitePipeline builds a SQLite-source pipeline over oracle_events.
 func oracleSQLitePipeline(id, dbPath, output string, fetchSize int) map[string]any {
-	p := newPipeline(id, oracleSQLiteSource(dbPath, fetchSize), destLocalJSONL(output, ""))
+	return oracleSQLitePipelineForTable(id, dbPath, output, fetchSize, "oracle_events")
+}
+
+func oracleSQLitePipelineForTable(id, dbPath, output string, fetchSize int, table string) map[string]any {
+	p := newPipeline(id, sourceSQLite(dbPath, table, "event_time", "id", fetchSize, map[string]any{
+		"name": "oracle-input",
+	}), destLocalJSONL(output, ""))
 	p["runtime"] = map[string]any{
 		"poll_interval":       "10ms",
 		"send_batch_size":     fetchSize,

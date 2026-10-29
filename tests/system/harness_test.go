@@ -351,6 +351,28 @@ func (p *proc) kill() (int, string) {
 	return p.waitExit(10 * time.Second)
 }
 
+// exitedWithin reports whether the process exited within d, without
+// killing it. It is used by tests that accept either a clean refusal to
+// start or a running process.
+func (p *proc) exitedWithin(d time.Duration) (code int, exited bool, logs string) {
+	p.t.Helper()
+	select {
+	case err := <-p.waitCh:
+		p.done = true
+		p.logFile.Close()
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else {
+				code = -1
+			}
+		}
+		return code, true, p.log()
+	case <-time.After(d):
+		return 0, false, p.log()
+	}
+}
+
 func (p *proc) log() string {
 	data, err := os.ReadFile(p.logPath)
 	if err != nil {
