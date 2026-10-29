@@ -587,15 +587,17 @@ func waitForMetric(t *testing.T, addr, name string, labels map[string]string, ti
 // --- scripted HTTP sink ---
 
 type sink struct {
-	mu       sync.Mutex
-	statuses []int
-	delay    time.Duration
-	requests int
-	entries  int
-	accepted int
-	bodies   [][]byte
-	headers  []http.Header
-	methods  []string
+	mu             sync.Mutex
+	statuses       []int
+	statusFn       func() int
+	delay          time.Duration
+	requests       int
+	entries        int
+	accepted       int
+	bodies         [][]byte
+	acceptedBodies [][]byte
+	headers        []http.Header
+	methods        []string
 }
 
 func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
@@ -605,7 +607,9 @@ func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
 		body, _ := io.ReadAll(r.Body)
 		s.mu.Lock()
 		status := http.StatusOK
-		if len(s.statuses) > 0 {
+		if s.statusFn != nil {
+			status = s.statusFn()
+		} else if len(s.statuses) > 0 {
 			idx := s.requests
 			if idx >= len(s.statuses) {
 				idx = len(s.statuses) - 1
@@ -618,6 +622,7 @@ func newSink(t *testing.T, statuses ...int) (*sink, *httptest.Server) {
 		s.entries += len(entries)
 		if status < 400 {
 			s.accepted += len(entries)
+			s.acceptedBodies = append(s.acceptedBodies, body)
 		}
 		s.bodies = append(s.bodies, body)
 		s.headers = append(s.headers, r.Header.Clone())
@@ -647,9 +652,11 @@ func (s *sink) setStatuses(statuses ...int) {
 	s.mu.Unlock()
 }
 
-func (s *sink) setDelay(d time.Duration) {
+// setStatusFunc installs a per-request status chooser. It overrides the
+// fixed status script and lets a scenario vary the outcome of every call.
+func (s *sink) setStatusFunc(fn func() int) {
 	s.mu.Lock()
-	s.delay = d
+	s.statusFn = fn
 	s.mu.Unlock()
 }
 
@@ -705,6 +712,24 @@ func (s *sink) deliveredLogEntries(t *testing.T) []core.LogEntry {
 // deliveredSentinelRecords decodes every request body as the flattened
 // Sentinel records a sentinel or local_jsonl format="sentinel" write
 // produces.
+// acceptedLogEntries decodes only the request bodies the server accepted.
+// Failed attempts are not deliveries and must not count in the oracle.
+func (s *sink) acceptedLogEntries(t *testing.T) []core.LogEntry {
+	t.Helper()
+	s.mu.Lock()
+	bodies := append([][]byte(nil), s.acceptedBodies...)
+	s.mu.Unlock()
+	var out []core.LogEntry
+	for i, body := range bodies {
+		var entries []core.LogEntry
+		if err := json.Unmarshal(body, &entries); err != nil {
+			t.Fatalf("decode accepted body %d: %v", i, err)
+		}
+		out = append(out, entries...)
+	}
+	return out
+}
+
 func (s *sink) deliveredSentinelRecords(t *testing.T) []map[string]string {
 	t.Helper()
 	s.mu.Lock()
