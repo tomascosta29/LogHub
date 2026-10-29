@@ -49,7 +49,7 @@ func TestHealthReportsStartedAtAndAppliesStaleness(t *testing.T) {
 		t.Fatalf("pipelines = %d", len(h.Pipelines))
 	}
 	if h.Pipelines[0].StartedAt.IsZero() {
-		t.Fatalf("/health StartedAt is zero; staleness cannot be measured from startup")
+		t.Errorf("/health StartedAt is zero; staleness cannot be measured from startup")
 	}
 
 	// With no collect or send and a 1 s staleness threshold, the endpoint
